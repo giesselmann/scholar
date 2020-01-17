@@ -1,0 +1,179 @@
+# activate virtual environment
+source /project/minion/virtual/scholar/bin/activate
+
+# extract meta information and title-abstract pairs from dataset
+cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 32 bash meta.sh
+
+# extract journals
+zcat meta/*.gz | cut -f3 | sort | uniq -c -i | awk '{$1=$1;print}' | sort -k1 > journals.tsv
+
+# convert title+abstract to tf-record training data for Transformer
+
+
+# check our papers
+```
+zcat meta/*.gz | grep 'repeat' | grep 'methylation state'
+0b7474d544b917b1aac9f327ec81708444989346        2005    The EMBO journal        The profile of repeat-associated histone lysine methylation states in the mouse epigenome.
+8904923e99e5cc2654bf49f3daed53906d95c45d        2007    Molecular cell  Structural basis for lower lysine methylation state-specific readout by MBT repeats of L3MBTL1 and an engineered PHD finger.
+1fcff5413b0895fac549b43f6df180abd157e10f        2019    Nature Biotechnology    Analysis of short tandem repeat expansions and their methylation state with nanopore sequencing
+f04426401d452dcdf25a5309212b1dace8ab154b        2011    Molecular biology and evolution Reconstructing the ancestral germ line methylation state of young repeats.
+```
+
+```
+zcat meta/*.gz | grep 'Nanopype'
+81049aac9c0b5503e3fd36087012feab7e81b9d8        2019    Bioinformatics  Nanopype: a modular and scalable nanopore data processing pipeline
+5ee7b3dc3031fa6b8759fe7940361656096fd1de        2019    Bioinformatics  Nanopype: a modular and scalable nanopore data processing pipeline
+```
+
+
+
+# characterize dataset
+# use t-SNE on word embeddings
+python
+```
+import glob
+import gzip
+import nltk
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.feature_extraction import text
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.snowball import SnowballStemmer
+
+import seaborn as sns
+sns.set(rc={'figure.figsize':(11.7,8.27)})
+palette = sns.color_palette("bright", 2)
+
+#nltk.download('words', download_dir='/project/minion/virtual/scholar/nltk_data')
+english_vocab = set(w.lower() for w in nltk.corpus.words.words())
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+stop_words = text.ENGLISH_STOP_WORDS.union(punc)
+
+data_files = glob.glob('meta/s2-corpus-*.gz')
+data_meta = [tuple(line.split('\t')) for file in data_files for line in gzip.open(file, 'r').read().decode('utf-8').split('\n')]
+
+data_headlines_all = [x[3] for x in data_meta if len(x) == 4]
+data_headlines_eng = [l for l in data_headlines_all if len(english_vocab.intersection(set([t for t in l.lower().split() if t.isalpha()]))) > 0.05 * len(l)]
+data_headlines = data_headlines_eng
+
+print('All headlines : {}, english: {}'.format(len(data_headlines_all), len(data_headlines_eng)))
+
+stemmer = SnowballStemmer('english')
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+vectorizer = TfidfVectorizer(stop_words = stop_words, tokenizer = tokenize, max_features = 16000)
+X = vectorizer.fit_transform(data_headlines)
+words = vectorizer.get_feature_names()
+print(words[250:300])
+
+tsne = TSNE()
+X_embedded = tsne.fit_transform(X)
+y = ['sequence' if 'sequenc' in w else 'other' for w in data_headlines]
+sns.scatterplot(X_embedded[:,0], X_embedded[:,1], hue=y, legend='full', palette=palette)
+plt.show()
+```
+
+
+
+
+# characterize dataset
+# use t-SNE on word embeddings
+python
+```
+import glob, gzip, json, re
+import nltk
+from tqdm import tqdm
+
+from sklearn.feature_extraction import text
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.snowball import SnowballStemmer
+
+from datasketch import MinHash, MinHashLSHForest
+
+
+# load abstract and titles
+data_files = glob.glob('abstract/s2-corpus-*.gz')
+data_full = [json.loads(line) for file in data_files for line in gzip.open(file, 'r').read().decode('utf-8').split('\n') if line != '']
+
+#nltk.download('words', download_dir='/project/minion/virtual/scholar/nltk_data')
+english_vocab = set(w.lower() for w in nltk.corpus.words.words())
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+stop_words = text.ENGLISH_STOP_WORDS.union(punc)
+
+data_eng = [line for line in data_full if len(english_vocab.intersection(set([t for t in line['paperAbstract'].lower().split() if t.isalpha()]))) > 0.05 * len(line['paperAbstract'])]
+data_text = [record['title'] + ' ' + record['paperAbstract'] for record in data_eng]
+
+print('All datasets : {}, english: {}'.format(len(data_full), len(data_eng)))
+
+data_text_nano = [record for record in data_text if 'nanopore sequencing' in record]
+
+# Build LSH Forrest
+permutations = 128
+minhash = []
+for record in data_text_nano:
+    tokens = re.sub(r'[^\w\s]','',record).lower().split()
+    m = MinHash(num_perm=permutations)
+    _ = [m.update(t.encode('utf-8')) for t in tokens]
+    minhash.append(m)
+
+forest = MinHashLSHForest(num_perm=permutations)
+for i,m in enumerate(minhash):
+    forest.add(i,m)
+
+forest.index()
+
+
+# Querry LSH Forrest
+tokens = re.sub(r'[^\w\s]','', 'Repeat expansion and methylation state anaysis using nanopore sequencing').lower().split()
+m = MinHash(num_perm=permutations)
+_ = [m.update(t.encode('utf-8')) for t in tokens]
+idx_array = np.array(forest.query(m, 5))
+
+_ = [print(data_text_nano[i]) for i in idx_array]
+
+
+
+
+
+
+
+
+stemmer = SnowballStemmer('english')
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+vectorizer = TfidfVectorizer(stop_words = stop_words, tokenizer = tokenize, max_features = 16000)
+X = vectorizer.fit_transform(data_text)
+words = vectorizer.get_feature_names()
+print(words[250:300])
+
+
+```
+
+
+
+R
+```
+require(plyr)
+require(ggplot2)
+
+data = data.frame()
+for (f in list.files(path='meta', pattern='*.gz')){
+    data <- rbind(data, read.table(gzfile(paste('meta', f, sep='/')), sep='\t', fill=T, header=F, col.names=c('ID', 'year', 'journal', 'title')))
+}
+
+data_year <- ddply(data, ~year, summarize, n=length(ID))
+data_jnl <- ddply(data, ~journal, summarize, n=length(ID))
+data_jnl_year <- ddply(data, ~journal+year, summarize, n=length(ID))
+
+ggplot(data_year, aes(x=year, y=n)) + geom_bar(stat='identity')
+```
