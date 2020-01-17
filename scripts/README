@@ -7,6 +7,34 @@ cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 32 bash meta.sh
 # extract journals
 zcat meta/*.gz | cut -f3 | sort | uniq -c -i | awk '{$1=$1;print}' | sort -k1 > journals.tsv
 
+# extract vocabulary
+python3
+```
+import glob, gzip, re
+import nltk
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
+from collections import Counter
+from sklearn.feature_extraction import text
+
+#nltk.download('words', download_dir='/project/minion/virtual/scholar/nltk_data')
+english_vocab = set(w.lower() for w in nltk.corpus.words.words())
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+stop_words = text.ENGLISH_STOP_WORDS.union(punc)
+
+data_files = glob.glob('abstract/s2-corpus-*.gz')
+data_full = [json.loads(line) for file in data_files for line in gzip.open(file, 'r').read().decode('utf-8').split('\n') if line != '']
+
+data_eng = [line for line in data_full if len(english_vocab.intersection(set([t for t in line['paperAbstract'].lower().split() if t.isalpha()]))) > 0.05 * len(line['paperAbstract'])]
+data_text = [record['title'] + ' ' + record['paperAbstract'] for record in data_eng]
+
+vocabulary = Counter([word for paper in tqdm(data_text) for word in re.split('\W+', paper.lower()) if word not in stop_words])
+
+with open('vocabulary.tsv', 'w') as fp:
+    print('\n'.join(['\t'.join(t) for t in vocabulary.most_common()]), file=fp)
+```
+
 # convert title+abstract to tf-record training data for Transformer
 
 
