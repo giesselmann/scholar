@@ -61,7 +61,7 @@ predict     Predict title from abstract
         parser.add_argument("vocabulary", help="Training vocabulary")
         parser.add_argument("--config", default=None, help="Transformer config file")
         parser.add_argument("--prefix", default="", help="Checkpoint and event prefix")
-        parser.add_argument("--title_length", type=int, default=20, help="Maximum title length")
+        parser.add_argument("--title_length", type=int, default=25, help="Maximum title length")
         parser.add_argument("--abstract_length", type=int, default=300, help="Maximum abstract length")
         parser.add_argument("--minibatch_size", type=int, default=16, help="Minibatch size")
         parser.add_argument("--batches_train", type=int, default=3000000, help="Training batches")
@@ -135,7 +135,8 @@ predict     Predict title from abstract
                     .prefetch(args.minibatch_size * 64)
                     .padded_batch(args.minibatch_size,
                         padded_shapes=(([args.abstract_length,], [1,]), ([args.title_length,], [1,])),
-                        drop_remainder=True))
+                        drop_remainder=True)
+                    .repeat())
 
         transformer_hparams_file = (args.config or os.path.join('./training_configs', args.prefix, 'hparams.yaml'))
         if os.path.exists(transformer_hparams_file):
@@ -163,10 +164,10 @@ predict     Predict title from abstract
                                #'act_type' : 'separable_convolution',
                                'encoder_act_type' : 'point_wise',
                                'decoder_act_type' : 'point_wise',
-                               'act_dff' : 16,
+                               'act_dff' : None,
                                #'act_conv_filter' : 5,
-                               'encoder_time_penalty' : 0.01,
-                               'decoder_time_penalty' : 0.1,
+                               'encoder_time_penalty' : 0.05,
+                               'decoder_time_penalty' : 0.05,
                                }
             os.makedirs(os.path.dirname(transformer_hparams_file), exist_ok=True)
             with open(transformer_hparams_file, 'w') as fp:
@@ -217,7 +218,7 @@ predict     Predict title from abstract
                     enc_loss = tf.nn.compute_average_loss(_enc_loss, global_batch_size=args.minibatch_size)
                     dec_loss = tf.nn.compute_average_loss(_dec_loss, global_batch_size=args.minibatch_size)
                 tf_gradients = tape.gradient([tf_loss, enc_loss, dec_loss], transformer.trainable_variables)
-                tf_gradients, _ = tf.clip_by_global_norm(tf_gradients, 5.0)
+                tf_gradients, _ = tf.clip_by_global_norm(tf_gradients, 10.0)
                 # Apply gradients
                 tf_optimizer.apply_gradients(zip(tf_gradients, transformer.trainable_variables))
                 # reset and update accuracies

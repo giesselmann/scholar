@@ -33,7 +33,7 @@ from tf_util import positional_encoding
 
 
 
-kernel_initializer = 'he_normal'
+kernel_initializer = 'he_uniform'
 
 
 
@@ -95,13 +95,13 @@ def point_wise_feed_forward_network(d_model, dff, nff=1):
         inner.extend(
             [
             tf.keras.layers.Dense(dff,
-                kernel_initializer=kernel_initializer,
+                kernel_initializer='he_uniform',
                 activation=tf.nn.relu),
             tf.keras.layers.LayerNormalization(epsilon=1e-6)
             ])
     return tf.keras.Sequential(
             inner + [tf.keras.layers.Dense(d_model,
-                kernel_initializer=kernel_initializer,
+                kernel_initializer='glorot_uniform',
                 activation=None)]
             )
 
@@ -269,15 +269,15 @@ def point_wise_act_network(dff, ponder_bias_init=1.0):
         layers += [
                     # (batch_size, seq_len, dff)
                     tf.keras.layers.Dense(dff,
-                        kernel_initializer=kernel_initializer,
-                        activation=tf.nn.relu),
+                        kernel_initializer='he_uniform',
+                        activation=tf.nn.elu),
                     tf.keras.layers.LayerNormalization(epsilon=1e-6)
                     ]
     layers += [
                 # (batch_size, seq_len, 1)
                 tf.keras.layers.Dense(1,
                     use_bias=True,
-                    kernel_initializer=kernel_initializer,
+                    kernel_initializer='he_uniform',
                     bias_initializer=tf.constant_initializer(ponder_bias_init),
                     activation=tf.nn.sigmoid),
                 ]
@@ -335,9 +335,17 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         # v, k, q, step, caches
         assert isinstance(input_shape, list) and (len(input_shape) == 3 or len(input_shape) == 5)
         _, _, d_model = input_shape[2]  # q.shape
-        self.wq = tf.keras.layers.Dense(self.d_model, kernel_initializer=kernel_initializer)
-        self.wk = tf.keras.layers.Dense(self.d_model, kernel_initializer=kernel_initializer)
-        self.wv = tf.keras.layers.Dense(self.d_model, kernel_initializer=kernel_initializer)
+        kernel_init = 'glorot_uniform'
+        act = None
+        self.wq = tf.keras.layers.Dense(self.d_model,
+                    activation=act,
+                    kernel_initializer=kernel_init)
+        self.wk = tf.keras.layers.Dense(self.d_model,
+                    activation=act,
+                    kernel_initializer=kernel_init)
+        self.wv = tf.keras.layers.Dense(self.d_model,
+                    activation=act,
+                    kernel_initializer=kernel_init)
         if self.memory_comp:
             self.k_comp = tf.keras.layers.SeparableConv1D(self.d_model,
                                 kernel_size=self.memory_comp,
@@ -352,8 +360,8 @@ class MultiHeadAttention(tf.keras.layers.Layer):
                                 #activation=tf.nn.leaky_relu,
                                 data_format='channels_last')
         self.dense = tf.keras.layers.Dense(self.d_model,
-                                kernel_initializer=kernel_initializer,
-                                activation=None)
+                                kernel_initializer=kernel_init,
+                                activation=tf.nn.tanh)
         return super(MultiHeadAttention, self).build(input_shape)
 
     def split_heads(self, x, seq_len):
@@ -685,6 +693,7 @@ class Encoder(tf.keras.layers.Layer):
     def build(self, input_shape):
         assert len(input_shape) == 3
         _, sequence_length, d_model = input_shape
+        self.norm_layer = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.pos_encoding = positional_encoding(int(sequence_length),
                                                             self.max_iterations,
                                                             int(self.d_model),
@@ -698,7 +707,8 @@ class Encoder(tf.keras.layers.Layer):
 
     def call(self, x, training, mask):
         state = x
-        state *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        #state *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        state = self.norm_layer(state)
         # init ACT
         state_shape_static = state.get_shape() # (batch_size, sig_len, d_model)
         state_slice = slice(0, 2)
@@ -795,6 +805,7 @@ class Decoder(tf.keras.layers.Layer):
     def build(self, input_shape):
         assert isinstance(input_shape, list) and len(input_shape) == 4
         _, sequence_length, d_model = input_shape[0]
+        self.norm_layer = tf.keras.layers.LayerNormalization(epsilon=1e-6)
         self.pos_encoding = positional_encoding(int(sequence_length),
                                                 self.max_iterations,
                                                 int(self.d_model),
@@ -818,7 +829,8 @@ class Decoder(tf.keras.layers.Layer):
         look_ahead_mask = tf.maximum(target_padding_mask, self.look_ahead_mask)
         seq_len = tf.shape(x)[1]
         # scale
-        state = x * tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        #state = x * tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        state = self.norm_layer(x)
         # init ACT
         # state.shape (batch_size, seq_len, d_model)
         if step is not None:
