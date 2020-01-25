@@ -1,5 +1,6 @@
 # activate virtual environment
 source /project/minion/virtual/scholar/bin/activate
+source ~/virtual/scholar/bin/activate
 repo="/mnt/d/git/scholar"
 
 # install nltk english
@@ -24,8 +25,15 @@ python3 ${repo}/scripts/tf_vocabulary.py
 # extract journals
 zcat meta/*.gz | cut -f3 | sort | uniq -c -i | awk '{$1=$1;print}' | perl -pe 's/ /\t/' | sort -k1,1n > journals.tsv
 
+# bioRxiv
+# count words
+python3
+```
+import glob, gzip, re
 
+data_file = 'data/bioRxiv.gz'
 
+```
 
 
 
@@ -61,6 +69,18 @@ vocabulary = Counter([word for paper in tqdm(data_text) for word in re.split('\W
 with open('vocabulary.tsv', 'w') as fp:
     print('\n'.join(['\t'.join(t) for t in vocabulary.most_common()]), file=fp)
 ```
+
+
+
+
+
+
+
+
+
+
+
+
 
 # check our papers
 ```

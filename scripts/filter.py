@@ -42,5 +42,5 @@ if __name__ == '__main__':
             j_name = re.sub(' +', ' ', fields['journalName'].replace('\n', ' ').replace('\t', ' '))
             title = re.sub(' +', ' ', fields['title'].replace('\n', ' ').replace('\t', ' '))
             abstract = re.sub(' +', ' ', fields['paperAbstract'].replace('\n', ' ').replace('\t', ' '))
-            year = str(fields['year']) if str(fields['year']).isnumeric() else ''
-            print(json.dumps({'id': fields['id'], 'journalName':j_name, 'title':title, 'paperAbstract':abstract}, sort_keys=True))
+            year = str(fields['year']) if str(fields['year']).isnumeric() else 'NA'
+            print(json.dumps({'id': fields['id'], 'year' : year, 'journalName':j_name, 'title':title, 'paperAbstract':abstract}, sort_keys=True))
