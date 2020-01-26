@@ -279,6 +279,9 @@ predict     Predict title from abstract
                         test_accuracy.reset_states()
                 print("Epoch {}: train loss: {}".format(epoch, train_loss))
 
+    def predict(self, argv):
+        pass
+
 
 
 

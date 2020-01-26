@@ -10,8 +10,8 @@ import nltk
 nltk.download('words', download_dir='/project/minion/virtual/scholar/nltk_data')
 ```
 
-# extract meta information and title-abstract pairs from dataset
-cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 8 bash ${repo}/scripts/meta.sh ${repo}/scripts
+# filter s2 dataset
+cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 8 bash ${repo}/scripts/filter.sh ${repo}/scripts
 
 # generate TF training database from titles and abstracts
 cat data/manifest.txt | grep 's2-corpus' | sed 's/.gz//' | xargs -n 1 -P 12 bash ${repo}/scripts/tf_abstracts.sh ${repo}/scripts
@@ -22,16 +22,176 @@ python3 ${repo}/scripts/tf_vocabulary.py
 
 # tokenizer_en = tfds.features.text.SubwordTextEncoder.load_from_file('tf_vocabulary')
 
-# extract journals
-zcat meta/*.gz | cut -f3 | sort | uniq -c -i | awk '{$1=$1;print}' | perl -pe 's/ /\t/' | sort -k1,1n > journals.tsv
 
-# bioRxiv
-# count words
+
+
+# extract journals
 python3
 ```
-import glob, gzip, re
+import glob, gzip, json
+import itertools
+from tqdm import tqdm
+
+data_files = glob.glob('data_filtered/s2-corpus-*.gz')
+data_files += ['data/bioRxiv.gz']
+
+keys = ['journalName', 'year']
+def parse_line(line):
+    fields = json.loads(line)
+    return tuple([fields[key] for key in keys])
+
+data_jnl = [parse_line(line) for file in tqdm(data_files, desc="parsing batches") for line in gzip.open(file, 'r').read().decode('utf-8').split('\n') if line != '']
+data_jnl.sort()
+data_jnl_year = [(key) + (len(list(values)),) for key, values in itertools.groupby(data_jnl)]
+with open('journals.tsv', 'w') as fp:
+    print('\n'.join(['\t'.join([str(s) for s in record]) for record in data_jnl_year]), file=fp)
+
+```
+
+
+
+
+# bioRxiv
+python3
+```
+import glob, gzip, json, re
+import itertools
+import numpy as np
+import seaborn as sns
+import pandas as pd
+import umap
+import hdbscan
+import umap.plot
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from collections import Counter
+from datasketch import MinHash
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.cluster import AgglomerativeClustering, DBSCAN, OPTICS, cluster_optics_dbscan
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.snowball import SnowballStemmer
+
 
 data_file = 'data/bioRxiv.gz'
+keys = ['id', 'year', 'title', 'paperAbstract']
+def parse_line(line):
+    fields = json.loads(line)
+    return tuple([fields[key] for key in keys])
+
+data = [parse_line(line) for line in gzip.open(data_file, 'r').read().decode('utf-8').split('\n') if line != '']
+data.sort(key = lambda x : x[0])
+
+def reduce(key, values):
+    return sorted(list(values), key = lambda x : int(re.search(r'v([0-9]+)$', x[0]).group(1)) if re.search('v([0-9]+)$', x[0]) else x[0])[-1]
+
+data_unique = [reduce(key, values) for key, values in itertools.groupby(data, key = lambda x : re.sub('v[0-9]+$', '', x[0]))]
+vocabulary = Counter([word for paper in tqdm(data_unique, desc="get vocabulary") for word in set(re.split('\W+', ' '.join(paper[2:]).lower()))])
+sub_vocabulary = [word for word in vocabulary.most_common() if word[1] > 20 and word[1] < (len(data_unique) * 0.33)]
+sub_vocabulary.sort(key=lambda x : x[1])
+
+with open('cluster/bioRxiv.words.tsv', 'w') as fp:
+    print('\n'.join(['\t'.join([str(s) for s in t]) for t in sub_vocabulary]), file=fp)
+
+sub_words = set(w[0] for w in sub_vocabulary)
+
+#data_subset = [record for record in data_unique if 'nanopore' in record[1] or 'nanopore' in record[2]]
+data_subset = data_unique
+legend_years = np.array([int(x[1]) for x in data_subset])
+
+
+
+
+# MinHash
+# permutations = 256
+# minhash = []
+# for record in tqdm(data_subset, desc='hash articles'):
+#     tokens = re.sub(r'[^\w\s]','',' '.join(record[2:])).lower().split()
+#     m = MinHash(num_perm=permutations)
+#     _ = [m.update(t.encode('utf-8')) for t in tokens if t in sub_words]
+#     minhash.append(m)
+#
+# minhash_values = np.array([list(m.digest()) + [year,] for m, year in zip(minhash, legend_years)])
+#
+# pca = PCA(n_components=50)
+# minhash_pca = np.ascontiguousarray(pca.fit_transform(minhash_values))
+
+
+
+
+# Tokenize
+np.random.seed(42)
+stemmer = SnowballStemmer('english')
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower()) if word in sub_words]
+
+def tokenize2(text):
+    return [word for word in tokenizer.tokenize(text.lower()) if word in sub_words]
+
+vectorizer = TfidfVectorizer(tokenizer = tokenize, max_features = 16000)
+vectorizer_values = vectorizer.fit_transform([' '.join(record[2:]) for record in data_subset])
+
+pca = TruncatedSVD(n_components=50)
+vectorizer_pca = np.ascontiguousarray(pca.fit_transform(vectorizer_values))
+
+
+
+
+embedding_data = vectorizer_pca
+mapper = umap.UMAP(n_neighbors=64, min_dist=0.0, metric='manhattan', random_state=42, verbose=True).fit(embedding_data)
+
+legend_nanopore = np.array([1 if 'nanopore' in ' '.join(record[2:]) else 0 for record in data_subset])
+legend_sequencing = np.array([2 if 'sequencing' in ' '.join(record[2:]) else 0 for record in data_subset])
+legend = legend_nanopore + legend_sequencing
+color_key = {'other' : 'darkgrey', 'nanopore' : 'blue', 'sequencing' : 'magenta', 'nanopore sequencing' : 'red'}
+label_map = {0 : 'other', 1 : 'nanopore', 2 : 'sequencing', 3 : 'nanopore sequencing'}
+labels = np.array([label_map[l] for l in legend])
+
+plt.figure(figsize=(15,15))
+umap.plot.points(mapper, labels=np.array([label_map[l] for l in legend]), color_key=color_key, background='black')
+plt.savefig('plots/bioRxiv.umap.png', dpi=300)
+plt.close()
+
+
+
+
+# Cluster
+# AgglomerativeClustering
+clust = AgglomerativeClustering(n_clusters=None, linkage='ward', distance_threshold=5.0)
+X = StandardScaler().fit_transform(embedding_data)
+clust.fit(X)
+labels = clust.labels_
+
+
+# OPTICS
+clust = OPTICS(min_samples=50, xi=.05, min_cluster_size=.05, metric='manhattan', n_jobs=8)
+X = StandardScaler().fit_transform(embedding_data[:5000])
+clust.fit(X)
+labels_200 = cluster_optics_dbscan(reachability=clust.reachability_,
+                                   core_distances=clust.core_distances_,
+                                   ordering=clust.ordering_, eps=2)
+labels = clust.labels_[clust.ordering_]
+np.mean(labels)
+
+
+# DBSCAN
+clust = DBSCAN(eps=1.5, min_samples=50, metric='manhattan', n_jobs=8)
+X = StandardScaler().fit_transform(embedding_data)
+clust.fit(X)
+labels = clust.labels_
+
+
+# hdbscan
+clust = hdbscan.HDBSCAN(min_cluster_size=100, min_samples=20, allow_single_cluster=True, metric='chebyshev', core_dist_n_jobs=8)
+clust.fit(embedding_data)
+clust.labels_.max()
+
+labels = clust.labels_
+
+umap.plot.points(mapper, labels=labels, theme='fire', background='black', show_legend=True, width=128, height=128)
+plt.show()
 
 ```
 
