@@ -21,5 +21,5 @@ if __name__ == "__main__":
     record_files = glob.glob("tfrecords/*.tfrec")
     ds = tf.data.Dataset.from_tensor_slices(record_files)
     ds = ds.interleave(lambda x: tf.data.TFRecordDataset(filenames=x).map(tf_parse, num_parallel_calls=8), cycle_length=16, block_length=16)
-    tokenizer_en = tfds.features.text.SubwordTextEncoder.build_from_corpus((abstract.numpy() for abstract, title in tqdm(ds)), target_vocab_size=2**13)
-    tokenizer_en.save_to_file('tf_vocabulary')
+    tokenizer_en = tfds.features.text.SubwordTextEncoder.build_from_corpus((abstract.numpy() for abstract, title in tqdm(ds)), target_vocab_size=2**15)
+    tokenizer_en.save_to_file('tf_vocabulary_32k')

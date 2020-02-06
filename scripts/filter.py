@@ -31,6 +31,11 @@ from tqdm import tqdm
 
 
 
+def is_ascii(s):
+    return all(ord(c) < 128 and ord(c) > 31 for c in s)
+
+
+
 
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, lambda signal, frame: exit(0))
@@ -43,4 +48,6 @@ if __name__ == '__main__':
             title = re.sub(' +', ' ', fields['title'].replace('\n', ' ').replace('\t', ' '))
             abstract = re.sub(' +', ' ', fields['paperAbstract'].replace('\n', ' ').replace('\t', ' '))
             year = str(fields['year']) if str(fields['year']).isnumeric() else 'NA'
+            if not all([is_ascii(s) for s in [j_name, title, abstract, year]]):
+                continue
             print(json.dumps({'id': fields['id'], 'year' : year, 'journalName':j_name, 'title':title, 'paperAbstract':abstract}, sort_keys=True))

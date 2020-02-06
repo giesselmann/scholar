@@ -1,6 +1,8 @@
 # activate virtual environment
 source /project/minion/virtual/scholar/bin/activate
+PATH=${PATH}:/project/bioinf_meissner/bin
 source ~/virtual/scholar/bin/activate
+repo="/project/miniondev/src/scholar"
 repo="/mnt/d/git/scholar"
 
 # install nltk english
@@ -8,16 +10,18 @@ python3
 ```
 import nltk
 nltk.download('words', download_dir='/project/minion/virtual/scholar/nltk_data')
+nltk.download('stopwords', download_dir='/project/minion/virtual/scholar/nltk_data')
 ```
 
 # filter s2 dataset
-cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 8 bash ${repo}/scripts/filter.sh ${repo}/scripts
+cat data/manifest.txt | grep 's2-corpus' | xargs -n 1 -P 16 bash ${repo}/scripts/filter.sh ${repo}/scripts
 
 # generate TF training database from titles and abstracts
-cat data/manifest.txt | grep 's2-corpus' | sed 's/.gz//' | xargs -n 1 -P 12 bash ${repo}/scripts/tf_abstracts.sh ${repo}/scripts
+mkdir -p tfrecords
+cat data/manifest.txt | grep 's2-corpus' | sed 's/.gz//' | xargs -n 1 -P 16 bash ${repo}/scripts/tf_abstracts.sh ${repo}/scripts
 
 # generate vocabulary
-python3 ${repo}/scripts/tf_vocabulary.py
+python3 ${repo}/scholar/scholar.py vocabulary ./tfrecords/ tf_vocabulary
 # 3 519 035 it [09:59, 5873.42it/s]
 
 # tokenizer_en = tfds.features.text.SubwordTextEncoder.load_from_file('tf_vocabulary')
@@ -51,6 +55,40 @@ with open('journals.tsv', 'w') as fp:
 
 
 
+# plot journal stats
+R
+```
+require(plyr)
+require(ggplot2)
+require(stringr)
+
+data <- read.table('journals.tsv', col.names=c('journal', 'year', 'paper'), sep='\t', quote='', comment.char='')
+data_filtered <- subset(data, paper > 1)
+
+paper_per_year <- ddply(data_filtered, ~year, summarize, n=sum(paper))
+paper_per_year_bioRxiv <- ddply(subset(data_filtered, journal=='bioRxiv'), ~year, summarize, n=sum(paper))
+jnl_per_year <- ddply(data_filtered, ~year, summarize, n=length(journal))
+
+jnls_2019 <- subset(data_filtered, year==2019)
+jnls_top10 <- jnls_2019[order(jnls_2019$paper, decreasing=T),][1:10,]
+jnls_2019$group <- ifelse(startsWith(as.character(jnls_2019$journal), 'Nature'), 'Nature',
+                          ifelse(str_detect(as.character(jnls_2019$journal), '(Conference|Symposium|Workshop)'), 'Conference',
+                            ifelse(jnls_2019$journal == 'ArXiv', 'ArXiv',
+                              ifelse(jnls_2019$journal == 'bioRxiv', 'bioRxiv', 'other'))))
+jnls_2019$group <- factor(as.character(jnls_2019$group), levels=c('Conference', 'ArXiv', 'bioRxiv', 'Nature', 'other'))
+jnls_2019_summary <- ddply(jnls_2019, ~group, summarize, n=sum(paper))
+
+pdf('plots/stats.pdf')
+ggplot(paper_per_year, aes(x=year, y=n)) + geom_bar(stat='identity') + theme_classic()
+#ggplot(jnl_per_year, aes(x=year, y=n)) + geom_bar(stat='identity') + theme_classic()
+pie(jnls_2019_summary$n, labels = jnls_2019_summary$group, col=rainbow(length(jnls_2019_summary$group)), clockwise=T, main="Journals 2019")
+ggplot(paper_per_year_bioRxiv, aes(x=year, y=n)) + geom_bar(stat='identity') + theme_classic()
+dev.off()
+```
+
+
+
+
 # bioRxiv
 python3
 ```
@@ -60,18 +98,23 @@ import numpy as np
 import seaborn as sns
 import pandas as pd
 import umap
+import wordcloud
 import hdbscan
 import umap.plot
 import matplotlib.pyplot as plt
+import matplotlib.colors
 from tqdm import tqdm
-from collections import Counter
+from collections import Counter, defaultdict
 from datasketch import MinHash
+from wordcloud import WordCloud
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA, TruncatedSVD
-from sklearn.cluster import AgglomerativeClustering, DBSCAN, OPTICS, cluster_optics_dbscan
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN, OPTICS, cluster_optics_dbscan
 from nltk.tokenize import RegexpTokenizer
+from nltk.corpus import stopwords
 from nltk.stem.snowball import SnowballStemmer
+from nltk.stem.porter import PorterStemmer
 
 
 data_file = 'data/bioRxiv.gz'
@@ -122,76 +165,117 @@ legend_years = np.array([int(x[1]) for x in data_subset])
 
 # Tokenize
 np.random.seed(42)
-stemmer = SnowballStemmer('english')
+#stemmer = SnowballStemmer('english')
+stemmer = PorterStemmer()
 tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+
 def tokenize(text):
     return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower()) if word in sub_words]
 
 def tokenize2(text):
-    return [word for word in tokenizer.tokenize(text.lower()) if word in sub_words]
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
 
-vectorizer = TfidfVectorizer(tokenizer = tokenize, max_features = 16000)
+en_stop = stopwords.words('english')
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize2(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+vectorizer = TfidfVectorizer(stop_words = en_stop_token, tokenizer = tokenize2, min_df=10, max_df=0.5, max_features = 10000)
 vectorizer_values = vectorizer.fit_transform([' '.join(record[2:]) for record in data_subset])
 
-pca = TruncatedSVD(n_components=50)
-vectorizer_pca = np.ascontiguousarray(pca.fit_transform(vectorizer_values))
+svd = TruncatedSVD(n_components=150, random_state=42)
+vectorizer_pca = np.ascontiguousarray(svd.fit_transform(vectorizer_values))
+print("Explained variance: ", svd.explained_variance_ratio_.sum())
 
-
+np.savetxt('cluster/bioRxiv.pca.tsv', vectorizer_pca, fmt='%.6f', delimiter='\t')
+vectorizer_pca = np.loadtxt('cluster/bioRxiv.pca.tsv', delimiter='\t', dtype=np.float32)
 
 
 embedding_data = vectorizer_pca
-mapper = umap.UMAP(n_neighbors=64, min_dist=0.0, metric='manhattan', random_state=42, verbose=True).fit(embedding_data)
+mapper = umap.UMAP(n_neighbors=64, min_dist=0.0, metric='euclidean', random_state=42, verbose=True).fit(embedding_data)
 
 legend_nanopore = np.array([1 if 'nanopore' in ' '.join(record[2:]) else 0 for record in data_subset])
 legend_sequencing = np.array([2 if 'sequencing' in ' '.join(record[2:]) else 0 for record in data_subset])
 legend = legend_nanopore + legend_sequencing
-color_key = {'other' : 'darkgrey', 'nanopore' : 'blue', 'sequencing' : 'magenta', 'nanopore sequencing' : 'red'}
+
+color_key = {'other' : 'darkgrey', 'nanopore' : 'darkgrey', 'sequencing' : 'darkgrey', 'nanopore sequencing' : 'darkgrey'}
 label_map = {0 : 'other', 1 : 'nanopore', 2 : 'sequencing', 3 : 'nanopore sequencing'}
 labels = np.array([label_map[l] for l in legend])
 
-plt.figure(figsize=(15,15))
+plt.figure(figsize=(10,10))
 umap.plot.points(mapper, labels=np.array([label_map[l] for l in legend]), color_key=color_key, background='black')
-plt.savefig('plots/bioRxiv.umap.png', dpi=300)
+plt.savefig('plots/bioRxiv.umap.pdf', dpi=900)
+plt.close()
+
+color_key = {'other' : 'darkgrey', 'nanopore' : 'red', 'sequencing' : 'blue', 'nanopore sequencing' : 'magenta'}
+
+plt.figure(figsize=(10,10))
+umap.plot.points(mapper, labels=np.array([label_map[l] for l in legend]), color_key=color_key, background='black')
+plt.savefig('plots/bioRxiv_sequencing.umap.pdf', dpi=900)
 plt.close()
 
 
 
 
 # Cluster
-# AgglomerativeClustering
-clust = AgglomerativeClustering(n_clusters=None, linkage='ward', distance_threshold=5.0)
+# KMeans
+clust = KMeans(init='random', n_clusters=42, n_init=10, precompute_distances=True, n_jobs=10)
 X = StandardScaler().fit_transform(embedding_data)
-clust.fit(X)
-labels = clust.labels_
-
-
-# OPTICS
-clust = OPTICS(min_samples=50, xi=.05, min_cluster_size=.05, metric='manhattan', n_jobs=8)
-X = StandardScaler().fit_transform(embedding_data[:5000])
-clust.fit(X)
-labels_200 = cluster_optics_dbscan(reachability=clust.reachability_,
-                                   core_distances=clust.core_distances_,
-                                   ordering=clust.ordering_, eps=2)
-labels = clust.labels_[clust.ordering_]
-np.mean(labels)
-
-
-# DBSCAN
-clust = DBSCAN(eps=1.5, min_samples=50, metric='manhattan', n_jobs=8)
-X = StandardScaler().fit_transform(embedding_data)
-clust.fit(X)
-labels = clust.labels_
-
-
-# hdbscan
-clust = hdbscan.HDBSCAN(min_cluster_size=100, min_samples=20, allow_single_cluster=True, metric='chebyshev', core_dist_n_jobs=8)
 clust.fit(embedding_data)
-clust.labels_.max()
-
+cluster = clust.labels_
 labels = clust.labels_
 
-umap.plot.points(mapper, labels=labels, theme='fire', background='black', show_legend=True, width=128, height=128)
+np.savetxt('cluster/bioRxiv.labels_k42.tsv', cluster, fmt='%i', delimiter='\t')
+
+umap.plot.points(mapper, labels=labels, theme='fire', background='black', show_legend=False)
 plt.show()
+
+
+plt.figure(figsize=(10,10))
+umap.plot.points(mapper, labels=labels, theme='fire', background='black', show_legend=False)
+plt.savefig('plots/bioRxiv.umap_cluster.pdf', dpi=900)
+plt.close()
+plt.show()
+
+
+
+
+# Nanopore sequencing cluster
+msk_nanopore = np.array([True if re.search('^(?=.*nanopore)(?=.*sequencing).*$', ' '.join(record[2:]).lower()) else False for record in data_subset])
+clust_nanopore, clust_nanopore_counts = np.unique(labels[msk_nanopore], return_counts=True)
+# filter for clusters with at least 5 papers
+clust_nanopore, clust_nanopore_counts = zip(*[(v1, v2) for v1, v2 in zip(clust_nanopore, clust_nanopore_counts) if v2 > 5])
+clust_nanopore_dict = dict(zip(clust_nanopore, clust_nanopore_counts))
+
+clust_nanopore_label = np.array([str(clust_nanopore_dict[cluster]) if cluster in clust_nanopore_dict else '<5' for cluster in labels])
+clust_nanopore_label = np.array([clust_nanopore_dict[cluster] if cluster in clust_nanopore_dict else 0 for cluster in labels])
+cmap = matplotlib.colors.Colormap('Blues', len(np.unique(clust_nanopore_label)))
+
+plt.figure(figsize=(10,10))
+umap.plot.points(mapper, labels=clust_nanopore_label, color_key_cmap='plasma', background='black', show_legend=True)
+plt.savefig('plots/bioRxiv.umap_cluster_nanopore.pdf', dpi=900)
+plt.show()
+
+
+
+
+# Nanopore cluster wordclouds
+x, y = np.ogrid[:300, :300]
+mask = (x - 150) ** 2 + (y - 150) ** 2 > 130 ** 2
+mask = 255 * mask.astype(int)
+for cluster_id, n_paper in clust_nanopore_dict.items():
+    text = '\n'.join([' '.join(record[2:]) for c, record in zip(cluster, data_subset) if c == cluster_id])
+    wc = WordCloud(background_color="black", repeat=False, mask=mask, width=800, height=800, scale=20.0)
+    wc.generate(text)
+    plt.figure(figsize=(10,10))
+    plt.axis("off")
+    plt.imshow(wc, interpolation="bilinear")
+    plt.savefig('plots/bioRxiv.wordmap_{}_{}.pdf'.format(n_paper, cluster_id), dpi=900)
+    plt.close()
+
+
+
+
 
 ```
 

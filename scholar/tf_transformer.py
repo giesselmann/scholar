@@ -117,7 +117,7 @@ def conv_feed_forward_network(d_model, dff, d_filter, nff=1, pool_size=3, paddin
                     tf.keras.layers.Conv1D(dff, d_filter,
                             padding=padding,
                             data_format='channels_last',
-                            activation=tf.nn.elu
+                            activation=tf.nn.relu
                             ),
                     tf.keras.layers.MaxPool1D(pool_size=pool_size,
                             strides=1,
@@ -361,7 +361,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
                                 data_format='channels_last')
         self.dense = tf.keras.layers.Dense(self.d_model,
                                 kernel_initializer=kernel_init,
-                                activation=tf.nn.tanh)
+                                activation=None)
         return super(MultiHeadAttention, self).build(input_shape)
 
     def split_heads(self, x, seq_len):
@@ -639,7 +639,7 @@ class ACT(tf.keras.layers.Layer):
         # Mask for inputs which have not halted yet
         still_running = tf.cast(tf.less(halting_probability, 1.0), tf.float32)
         if mask is not None:
-            halting_probability += tf.squeeze(mask) # (batch_size, seq_len) with 0.0 on valid steps
+            halting_probability += tf.squeeze(mask, axis=[1,2]) # (batch_size, seq_len) with 0.0 on valid steps
         # Mask of inputs which halted at this step
         new_halted = tf.cast(
             tf.greater(halting_probability + p * still_running, self.halt_threshold),
@@ -752,7 +752,7 @@ class Encoder(tf.keras.layers.Layer):
 
         # ponder loss
         if mask is not None:
-            _msk = tf.squeeze(1-mask)   # (batch_size, sig_len), 1.0 on valid steps
+            _msk = tf.squeeze(1-mask, axis=[1,2])   # (batch_size, sig_len), 1.0 on valid steps
             _lengths = tf.reduce_sum(_msk, axis=-1)
             n_updates *= _msk
             remainders *= _msk
@@ -834,7 +834,7 @@ class Decoder(tf.keras.layers.Layer):
         # init ACT
         # state.shape (batch_size, seq_len, d_model)
         if step is not None:
-            tpm = tf.squeeze(tf.ones_like(target_padding_mask))
+            tpm = tf.squeeze(tf.ones_like(target_padding_mask), axis=[1,2])
             step_idx = tf.stack([tf.range(tf.shape(tpm)[0], dtype=tf.int32),
                               tf.ones(tf.shape(tpm)[0], dtype=tf.int32) * step],
                               axis=-1)
@@ -899,7 +899,7 @@ class Decoder(tf.keras.layers.Layer):
 
         # ponder loss
         if target_padding_mask is not None:
-            _msk = tf.squeeze(1-target_padding_mask)   # (batch_size, seq_len), 1.0 on valid steps
+            _msk = tf.squeeze(1-target_padding_mask, axis=[1,2])   # (batch_size, seq_len), 1.0 on valid steps
             _lengths = tf.reduce_sum(_msk, axis=-1)
             n_updates *= _msk
             remainders *= _msk

@@ -32,7 +32,7 @@ import nltk
 import tensorflow as tf
 from tqdm import tqdm
 from collections import Counter
-from sklearn.feature_extraction import text
+#from sklearn.feature_extraction import text
 
 
 

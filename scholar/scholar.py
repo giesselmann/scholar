@@ -25,7 +25,7 @@
 #
 # Written by Pay Giesselmann
 # ---------------------------------------------------------------------------------
-import os, sys, yaml
+import os, sys, glob, yaml
 import random
 import argparse
 import numpy as np
@@ -44,6 +44,7 @@ class Scholar():
         description='Scholar title prediction',
         usage='''cholar.py <command> [<args>]
 Available Scholar commands are:
+vocabulary  Extract vocabulary from training corpus
 train       Train Scholar model
 predict     Predict title from abstract
     ''')
@@ -54,6 +55,28 @@ predict     Predict title from abstract
             parser.print_help(file=sys.stderr)
             exit(1)
         getattr(self, args.command)(sys.argv[2:])
+
+    def vocabulary(self, argv):
+        parser = argparse.ArgumentParser(description="Scholar training")
+        parser.add_argument("records", help="Training records")
+        parser.add_argument("vocabulary", help="Output vocabulary name")
+        parser.add_argument("--target_vocab_size", type=int, default=2**13, help="Target vocabulary size")
+        args = parser.parse_args(argv)
+
+        def tf_parse(eg):
+            example = tf.io.parse_example(
+                eg[tf.newaxis], {
+                    'title': tf.io.FixedLenFeature(shape=(), dtype=tf.string),
+                    'abstract': tf.io.FixedLenFeature(shape=(), dtype=tf.string),
+                    'journal' : tf.io.FixedLenFeature(shape=(), dtype=tf.string),
+                    'year' : tf.io.FixedLenFeature(shape=(), dtype=tf.string)})
+            return (example['abstract'][0], example['title'][0])
+
+        record_files = glob.glob(os.path.join(args.records, "*.tfrec"))
+        ds = tf.data.Dataset.from_tensor_slices(record_files)
+        ds = ds.interleave(lambda x: tf.data.TFRecordDataset(filenames=x).map(tf_parse, num_parallel_calls=8), cycle_length=16, block_length=16)
+        tokenizer_en = tfds.features.text.SubwordTextEncoder.build_from_corpus((abstract.numpy() for abstract, title in tqdm(ds)), target_vocab_size=args.target_vocab_size)
+        tokenizer_en.save_to_file(args.vocabulary)
 
     def train(self, argv):
         parser = argparse.ArgumentParser(description="Scholar training")
@@ -95,8 +118,7 @@ predict     Predict title from abstract
             return abstract, title
 
         def encode(abstract, title):
-          abstract = [tokenizer_en.vocab_size] + tokenizer_en.encode(
-              abstract.numpy()) + [tokenizer_en.vocab_size+1]
+          abstract = tokenizer_en.encode(abstract.numpy())
           title = [tokenizer_en.vocab_size] + tokenizer_en.encode(
               title.numpy()) + [tokenizer_en.vocab_size+1]
           return abstract, title
@@ -105,7 +127,7 @@ predict     Predict title from abstract
             result_abstract, result_title = tf.py_function(encode, [abstract, title], [tf.int64, tf.int64])
             result_abstract.set_shape([None])
             result_title.set_shape([None])
-            l0 = tf.cast(tf.expand_dims(tf.size(result_abstract), axis=-1) - 1, tf.int32)
+            l0 = tf.cast(tf.expand_dims(tf.size(result_abstract), axis=-1), tf.int32)
             l1 = tf.cast(tf.expand_dims(tf.size(result_title), axis=-1) - 1, tf.int32)
             return ((result_abstract, l0), (result_title, l1))
 
@@ -145,19 +167,21 @@ predict     Predict title from abstract
         else:
             transformer_hparams = {
                                'd_output' : tokenizer_en.vocab_size + 2,
-                               'd_model' : 512,
-                               'dff' : 2048,
+                               'd_model' : 1024,
+                               'dff' : 4096,
                                #'nff' : 4,
                                'encoder_nff' : 3,
-                               'decoder_nff' : 3,
+                               'decoder_nff' : 4,
                                #'dff_type' : 'point_wise' or 'convolution' or 'separable_convolution' or 'inception'
-                               'encoder_dff_type' : 'point_wise',
+                               'encoder_dff_type' : 'separable_convolution',
                                'decoder_dff_type' : 'point_wise',
                                #'dff_filter_width', 'encoder_dff_filter_width', 'encoder_dff_pool_size'
-                               # 'decoder_dff_filter_width', decoder_dff_pool_sizeh
+                               # 'decoder_dff_filter_width', decoder_dff_pool_size
+                               'encoder_dff_filter_width' : 16,
+                               'encoder_dff_pool_size' : 8,
                                'num_heads' : 8,
-                               'encoder_max_iterations' : 8,   # 14
-                               'decoder_max_iterations' : 8,
+                               'encoder_max_iterations' : 1,   # 14
+                               'decoder_max_iterations' : 14,
                                'encoder_time_scale' : 10000,
                                'decoder_time_scale' : 10000,
                                'ponder_bias_init' : 1.0,
@@ -166,8 +190,8 @@ predict     Predict title from abstract
                                'decoder_act_type' : 'point_wise',
                                'act_dff' : None,
                                #'act_conv_filter' : 5,
-                               'encoder_time_penalty' : 0.05,
-                               'decoder_time_penalty' : 0.05,
+                               'encoder_time_penalty' : 0.01,
+                               'decoder_time_penalty' : 0.01,
                                }
             os.makedirs(os.path.dirname(transformer_hparams_file), exist_ok=True)
             with open(transformer_hparams_file, 'w') as fp:
@@ -280,7 +304,62 @@ predict     Predict title from abstract
                 print("Epoch {}: train loss: {}".format(epoch, train_loss))
 
     def predict(self, argv):
-        pass
+        parser = argparse.ArgumentParser(description="Scholar validation")
+        parser.add_argument("vocabulary", help="Training vocabulary")
+        parser.add_argument("config", default=None, help="Transformer config file")
+        parser.add_argument("checkpoint", help="Checkpoint from training")
+        parser.add_argument("abstract", help="Text files with one abstract per line")
+        args = parser.parse_args(argv)
+        # load vocabulary
+        if not os.path.exists(args.vocabulary + '.subwords'):
+            raise FileNotFoundError(args.vocabulary)
+        tokenizer_en = tfds.features.text.SubwordTextEncoder.load_from_file(args.vocabulary)
+        print("Loaded vocabulary with {} subwords".format(tokenizer_en.vocab_size))
+        # load config
+        if not os.path.exists(args.config):
+            raise FileNotFoundError(args.config)
+        with open(args.config, 'r') as fp:
+            transformer_hparams = yaml.safe_load(fp)
+        transformer = Transformer(hparams=transformer_hparams, name='Transformer')
+        # load latest checkpoint
+        tf_checkpoint = tf.train.Checkpoint(transformer=transformer)
+        tf_ckpt_manager = tf.train.CheckpointManager(tf_checkpoint, args.checkpoint, max_to_keep=5)
+        if tf_ckpt_manager.latest_checkpoint:
+            tf_checkpoint.restore(tf_ckpt_manager.latest_checkpoint).expect_partial()
+            print('Latest transformer checkpoint restored!!', file=sys.stderr)
+        else:
+            print("No training checkpoint found in {}".format(args.checkpoint), file=sys.stderr)
+            exit(-1)
+        # load abstracts
+        if not os.path.exists(args.abstract):
+            raise FileNotFoundError(args.abstract)
+        abstracts = []
+        with open(args.abstract, 'r') as fp:
+            abstracts = [line.strip() for line in fp.read().split('\n') if line]
+        print("Loaded {} abstracts.".format(len(abstracts)))
+        # predict per abstract
+        start_token = [tokenizer_en.vocab_size]
+        end_token = [tokenizer_en.vocab_size + 1]
+        MAX_ABSTRACT = 512
+        MAX_TITLE = 50
+        for num_abstract, abstract in enumerate(abstracts):
+            abstract_encoded = tokenizer_en.encode(abstract)
+            encoder_input = start_token + abstract_encoded + end_token + (end_token * (MAX_ABSTRACT - 2 - len(abstract_encoded)))
+            encoder_input = tf.expand_dims(encoder_input, 0)     # expand batch dimension
+            decoder_input = start_token
+            decoder_input = tf.expand_dims(decoder_input, 0)     # expand batch dimension
+            input_length = tf.cast(tf.reshape(tf.size(abstract_encoded) + 2, (-1, 1)) - 1, tf.int32)
+            target_length = tf.reshape(tf.cast(1, tf.int32), (-1,1))
+            for i in tqdm(range(MAX_TITLE), desc="abstract {}".format(num_abstract)):
+                predictions, _, _ = transformer([encoder_input, input_length, decoder_input, target_length], training=False)
+                predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
+                # return the result if the predicted_id is equal to the end token
+                if predicted_id[:,-1] == tokenizer_en.vocab_size+1:
+                    break
+                decoder_input = tf.concat([decoder_input, predicted_id[:,-1:]], axis=-1)
+                target_length += 1
+            predicted_sentence = tokenizer_en.decode([i for i in decoder_input[0,:] if i < tokenizer_en.vocab_size])
+            print("title {}:, {}".format(num_abstract, predicted_sentence))
 
 
 
