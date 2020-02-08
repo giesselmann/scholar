@@ -129,7 +129,7 @@ def get_article_worker(url_queue, record_queue, tbb_path, port=9050):
                          url_year = url_queue.get()
                          if url_year is None:
                              print("Worker thread received None, terminating.", file=sys.stderr)
-                             break
+                             return
                          url, year = url_year
                          try:
                              article = get_article(driver, url)
