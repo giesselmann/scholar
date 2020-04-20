@@ -1,6 +1,6 @@
 # \MODULE\-------------------------------------------------------------------------
 #
-#  CONTENTS      : Semantic Scholar S2 corpus meta data extraction
+#  CONTENTS      : Semantic Scholar S2 corpus language and encoding filter
 #
 #  DESCRIPTION   : none
 #
