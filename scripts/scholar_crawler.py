@@ -29,7 +29,8 @@ import os, sys, argparse
 import re, json
 import timeit, time
 import subprocess
-from tbselenium.tbdriver import TorBrowserDriver
+from selenium import webdriver
+#from tbselenium.tbdriver import TorBrowserDriver
 
 
 
@@ -62,6 +63,32 @@ class TorSession(object):
 
 
 
+class ChromeSession(object):
+    def __init__(self, cd_path, port=9050):
+        cmd = "{path} --port={port}".format(path=cd_path, port=port)
+        chrome_p = subprocess.Popen([cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        chrome_p_stdout = iter(chrome_p.stdout)
+        stdout = next(chrome_p_stdout)
+        while not b'Only local connections are allowed.' in stdout:
+            try:
+                stdout = next(tor_p_stdout)
+            except StopIteration:
+                print("Failed to start ChromeDriver on port {}".format(port), file=sys.stderr)
+                chrome_p.terminate()
+                self.chrome_p = None
+                return
+        self.chrome_p = chrome_p
+
+    def __enter__(self):
+        return self.chrome_p
+
+    def __exit__(self, type, value, traceback):
+        if self.chrome_p:
+            self.chrome_p.terminate()
+
+
+
+
 # parse google scholar querries
 class ScholarParser(object):
     def __init__(self, driver):
@@ -70,9 +97,18 @@ class ScholarParser(object):
     def record_from_querry(self, querry):
         querry_url = 'https://scholar.google.com/scholar?hl=de&as_sdt=0%2C5&q={}'.format(
             '+'.join(querry.split()))
-        self._driver.get(querry_url)
-        title = self._driver.find_element_by_class_name('gs_rt').text
-        return ScholarRecord(title, 0)
+        try:
+            self._driver.get(querry_url)
+            title = self._driver.find_element_by_class_name('gs_rt').text
+        except Exception as ex:
+            return ScholarRecord('', 0)
+        try:
+            cit_txt = self._driver.find_element_by_partial_link_text('Zitiert von').text
+        except Exception as ex:
+            cit_txt = ''
+        cit_nums = [int(x) for x in re.findall(r'\d+', cit_txt) if x.isdigit()]
+        cit_num = cit_nums[0] if cit_nums else 0
+        return ScholarRecord(title, cit_num)
 
 
 
@@ -94,12 +130,16 @@ class ScholarRecord(object):
 
 
 if __name__ == '__main__':
-    tbb_path = '/home/pay/tor/tor-browser_en-US/'
-    socks_port = 9050
-    querry = 'Analysis of short tandem repeat expansions and their methylation state with nanopore sequencing'
-    with TorSession(tbb_path, socks_port) as ts, \
-         TorBrowserDriver(tbb_path, socks_port=socks_port) as driver:
-          parser = ScholarParser(driver)
-          record = parser.record_from_querry(querry)
+    #tbb_path = '/home/pay/tor/tor-browser_en-US/'
+    port = 9050
+    chromedriver = '/mnt/d/scholar/chromedriver.exe'
+    querry1 = 'Analysis of short tandem repeat expansions and their methylation state with nanopore sequencing'
+    querry2 = 'DNA methylation and gene expression: endogenous retroviral genome becomes infectious after molecular cloning'
+    #with TorSession(tbb_path, port) as ts, \
+    #     TorBrowserDriver(tbb_path, socks_port=port) as driver:
+    with webdriver.Chrome(chromedriver) as driver:
+        parser = ScholarParser(driver)
+        record = parser.record_from_querry(querry1)
+    print('{} vs. {}'.format(t1-t0, t2-t1))
     print(record.title)
     print(record.citations)
