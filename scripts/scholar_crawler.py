@@ -29,10 +29,7 @@ import os, sys, argparse
 import re, json
 import timeit, time
 import subprocess
-from tqdm import tqdm
 from tbselenium.tbdriver import TorBrowserDriver
-from threading import Thread
-from queue import Queue
 
 
 
@@ -40,7 +37,7 @@ from queue import Queue
 # start tor as background process
 class TorSession(object):
     def __init__(self, tbb_path, port=9050):
-        tor_exec = args.tbb_path + '/Browser/TorBrowser/Tor/tor'
+        tor_exec = tbb_path + '/Browser/TorBrowser/Tor/tor'
         tor_p = subprocess.Popen([tor_exec, 'SocksPort', str(port), 'DataDirectory', "~/.tor_{}".format(port)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         tor_p_stdout = iter(tor_p.stdout)
         stdout = next(tor_p_stdout)
@@ -65,27 +62,44 @@ class TorSession(object):
 
 
 
-#
+# parse google scholar querries
 class ScholarParser(object):
-    def __init__(self):
-        pass
+    def __init__(self, driver):
+        self._driver = driver
 
-    def __enter__(self):
-        pass
-
-    def __exit__(self, type, value, traceback):
-        pass
+    def record_from_querry(self, querry):
+        querry_url = 'https://scholar.google.com/scholar?hl=de&as_sdt=0%2C5&q={}'.format(
+            '+'.join(querry.split()))
+        self._driver.get(querry_url)
+        title = self._driver.find_element_by_class_name('gs_rt').text
+        return ScholarRecord(title, 0)
 
 
 
 
 class ScholarRecord(object):
-    def __init__(self):
-        pass
+    def __init__(self, title='', citations=0):
+        self._title = title
+        self._citations = citations
+
+    @property
+    def title(self):
+        return self._title
+
+    @property
+    def citations(self):
+        return self._citations
 
 
 
 
 if __name__ == '__main__':
+    tbb_path = '/home/pay/tor/tor-browser_en-US/'
+    socks_port = 9050
     querry = 'Analysis of short tandem repeat expansions and their methylation state with nanopore sequencing'
-    
+    with TorSession(tbb_path, socks_port) as ts, \
+         TorBrowserDriver(tbb_path, socks_port=socks_port) as driver:
+          parser = ScholarParser(driver)
+          record = parser.record_from_querry(querry)
+    print(record.title)
+    print(record.citations)
