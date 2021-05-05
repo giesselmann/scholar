@@ -1,0 +1,421 @@
+python3
+```
+import os, sys, glob
+import gzip, re, json
+import sqlite3
+import itertools
+import tqdm
+import numpy as np
+import pandas as pd
+import matplotlib
+from collections import Counter
+from matplotlib import pyplot as plt
+import seaborn as sns
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+sns.set(style="ticks", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+
+# record data base
+#db_file = '../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+
+connection = sqlite3.connect(db_file)
+record_cursor = connection.cursor()
+citation_cursor = connection.cursor()
+ip_cursor = connection.cursor()
+
+
+# tuning
+record_cursor.execute("pragma journal_mode = MEMORY;")
+record_cursor.execute("pragma synchronous = OFF;")
+record_cursor.execute("""pragma page_size;""")
+record_cursor.fetchall()
+record_cursor.execute("""pragma cache_size = 100000;""")
+record_cursor.execute("""pragma cache_size;""")
+record_cursor.fetchall()
+
+
+# create tables
+sql_command = """
+CREATE TABLE journals (
+rowid INTEGER PRIMARY KEY,
+journal TEXT NOT NULL,
+year INTEGER NOT NULL,
+paper INTEGER DEFAULT 0,
+citing INTEGER DEFAULT 0,
+citing_mean REAL DEFAULT 0,
+citing_median REAL DEFAULT 0,
+citing_var REAL DEFAULT 0,
+cited INTEGER DEFAULT 0,
+cited_mean REAL DEFAULT 0,
+cited_median REAL DEFAULT 0,
+cited_var REAL DEFAULT 0
+);"""
+ip_cursor.execute(sql_command)
+
+sql_command = """
+CREATE TABLE record_citations (
+rowid INTEGER PRIMARY KEY,
+citing INTEGER DEFAULT 0,
+cited INTEGER DEFAULT 0,
+FOREIGN KEY (rowid) REFERENCES records (rowid) ON DELETE CASCADE ON UPDATE NO ACTION
+);"""
+ip_cursor.execute(sql_command)
+
+sql_command = """CREATE UNIQUE INDEX journals_idx ON journals(journal, year);"""
+ip_cursor.execute(sql_command)
+connection.commit()
+
+# list all tables and indices
+ip_cursor.execute('SELECT name from sqlite_master where type= "table"')
+ip_cursor.fetchall()
+ip_cursor.execute('SELECT name from sqlite_master where type= "index"')
+ip_cursor.fetchall()
+
+
+
+
+# JOURNAL IMPACT
+## total year journal pairs
+record_cursor.execute("""SELECT DISTINCT year, journal FROM records;""")
+records_total = len([year for year, journal in record_cursor])
+# 1.788.303
+
+record_cursor.execute("""SELECT ROWID, year, journal FROM records WHERE year IS NOT NULL AND journal IS NOT NULL ORDER BY year, journal;""")
+
+def insert_journal(key, values):
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    year, journal = key
+    paper = [paper for paper, _, _ in values]
+    citation_cursor.execute("""SELECT COUNT(ROWID) FROM citations WHERE citing IN ({}) GROUP BY citing;""".format(
+        ','.join([str(x) for x in paper])
+    ))
+    citing = [x[0] for x in citation_cursor]
+    citing += [0] * (len(paper) - len(citing))
+    citation_cursor.execute("""SELECT COUNT(ROWID) FROM citations WHERE cited IN ({}) GROUP BY cited;""".format(
+        ','.join([str(x) for x in paper])
+    ))
+    cited = [x[0] for x in citation_cursor]
+    cited += [0] * (len(paper) - len(cited))
+    ip_cursor.execute("""INSERT OR REPLACE INTO journals (journal, year, paper, citing, citing_mean, citing_median, citing_var, cited, cited_mean, cited_median, cited_var) VALUES ("{}", {}, {}, {}, '{}', '{}', '{}', {}, '{}', '{}', '{}');""".format(
+        escape_str(journal),
+        year,
+        len(paper),
+        len(citing),
+        np.mean(citing) if citing else 0.0,
+        np.median(citing) if citing else 0.0,
+        np.var(citing) if citing else 0.0,
+        len(cited),
+        np.mean(cited) if cited else 0.0,
+        np.median(cited) if cited else 0.0,
+        np.var(cited) if cited else 0.0
+    ))
+
+
+## 30 min on SSD,
+## 500-1000 it/s
+for key, values in tqdm.tqdm(itertools.groupby(record_cursor, key=lambda x : x[1:]), desc='Journal impact', ncols=100, total=records_total):
+    insert_journal(key, values)
+
+
+
+
+connection.commit()
+
+
+
+
+## test
+ip_cursor.execute("""SELECT * FROM journals WHERE journal='Nature' ORDER BY year;""")
+ip_cursor.fetchall()
+
+
+
+
+# PAPER CITATIONS SUMMARY
+record_cursor.execute("""SELECT COUNT(*) c FROM records;""")
+records_total = record_cursor.fetchone()[0]
+record_cursor.execute("""SELECT ROWID FROM records;""")
+
+def insert_record_citation(id):
+    # lookup citations
+    citation_cursor.execute("""SELECT COUNT(*) c FROM citations WHERE citing={};""".format(id))
+    citing = citation_cursor.fetchone()[0]
+    citation_cursor.execute("""SELECT COUNT(*) c FROM citations WHERE cited={};""".format(id))
+    cited = citation_cursor.fetchone()[0]
+    # insert into record_citations
+    sql_command = """INSERT OR REPLACE INTO record_citations (rowid, citing, cited) VALUES ({}, {}, {});""".format(id, citing, cited)
+    citation_cursor.execute(sql_command)
+
+
+## 1h on SSD
+## ~25k records/s
+for id in tqdm.tqdm(record_cursor, desc='Paper citations', ncols=100, total=records_total):
+      insert_record_citation(id[0])
+
+
+connection.commit()
+
+
+# stats
+## total entries
+record_cursor.execute("SELECT COUNT(*) FROM record_citations;")
+next(record_cursor)
+# 113.709.572
+# 116.275.278
+
+## records without citing or cited
+record_cursor.execute("SELECT COUNT(*) FROM record_citations WHERE citing = 0 and cited = 0;")
+next(record_cursor)
+# 46.599.083
+# 47.867.001
+
+## records with at least one citation
+record_cursor.execute("SELECT COUNT(*) FROM record_citations WHERE cited > 0;")
+next(record_cursor)
+# 55.413.159
+# 56.578.551
+
+record_cursor.execute("SELECT COUNT(*) FROM record_citations WHERE cited > 5;")
+next(record_cursor)
+# 26.867.382
+# 27.509.684
+
+
+
+#########################################################################################################################################
+# Plots
+#########################################################################################################################################
+# Paper over time
+record_cursor.execute("SELECT year, journal FROM records JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE record_citations.cited > 10 AND records.year >= 1950 AND records.year <= 2020;")
+df_paper = pd.DataFrame(record_cursor, columns=('year', 'journal'))
+
+record_cursor.execute("SELECT year, journal, paper, cited_mean, cited_median, cited_var FROM journals WHERE year >= 1950 AND year <= 2020;")
+df_journals = pd.DataFrame(record_cursor, columns=('year', 'journal', 'paper', 'cited_mean', 'cited_median', 'cited_var'))
+df_journals['period'] = pd.cut(df_journals.year, np.arange(1950, 2021, 5))
+
+df_paper_agg = df_paper.groupby('year').agg(
+    paper=('journal', 'count')
+).reset_index()
+
+df_journal_issues = df_journals[['year', 'journal', 'paper']].groupby(['year', 'journal']).count().groupby('journal').count()
+df_journals['issues'] = df_journal_issues.loc[df_journals.journal].values
+
+df_journals_agg = df_journals.groupby(['year', 'journal']).agg(
+    paper=('paper', 'sum')
+).reset_index().groupby('year').agg(
+    journals=('journal', 'count'),
+    paper=('paper', 'sum')).reset_index()
+
+df_journals_agg2 = df_journals[df_journals.issues >= 5].groupby(['year', 'journal']).agg(
+    paper=('paper', 'sum')
+).reset_index().groupby('year').agg(journals=('journal', 'count')).reset_index()
+
+
+# number of journals and paper
+f, ax = plt.subplots(ncols=2, figsize=(8,4))
+_ax = sns.lineplot(x='year', y='journals', data=df_journals_agg, ax=ax[0])
+_ax.fill_between(df_journals_agg.year, df_journals_agg.journals)
+_ax = sns.lineplot(x='year', y='paper', data=df_journals_agg, ax=ax[1])
+_ax.fill_between(df_journals_agg.year, df_journals_agg.paper)
+_ax = sns.lineplot(x='year', y='journals', color='red', data=df_journals_agg2, ax=ax[0])
+_ax.fill_between(df_journals_agg2.year, df_journals_agg2.journals, color='red')
+_ax = sns.lineplot(x='year', y='paper', color='red', data=df_paper_agg, ax=ax[1])
+_ax.fill_between(df_paper_agg.year, df_paper_agg.paper, color='red')
+f.tight_layout()
+f.savefig('journals.pdf')
+plt.close('all')
+
+
+# Paper in some known journals over time
+journals = set(df_journals.journal)
+plot_journals = ['Nature', 'Nature Genetics', 'Cell', 'Cell Stem Cell', 'Science', 'Bioinformatics']
+
+f, ax = plt.subplots(1, figsize=(4,4))
+ax = sns.lineplot(x='year', y='paper', hue='journal', data=df_journals[df_journals.journal.isin(plot_journals)])
+f.savefig('journals2.pdf')
+plt.close('all')
+
+
+# mean impact per period
+f, ax = plt.subplots(ncols=2, figsize=(12,6))
+_ax = sns.boxplot(x='period', y='paper', fliersize=0.0, data=df_journals, ax=ax[0])
+_ax.set_ylim(0, 200)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+_ax = sns.boxplot(x='period', y='cited_mean', fliersize=0.0, data=df_journals, ax=ax[1])
+_ax.set_ylim(0, 30)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+plt.tight_layout()
+f.savefig('journals_paper_mean_citations.pdf')
+plt.close('all')
+
+
+
+
+# Compare total field counts with high impact field counts
+total = record_cursor.execute("SELECT COUNT(*) c FROM record_citations WHERE impact IS NOT NULL;").fetchone()[0]
+record_cursor.execute("SELECT impact FROM record_citations WHERE impact IS NOT NULL;")
+impacts = np.fromiter((x[0] for x in record_cursor), dtype=np.float32, count=total)
+
+impacts_q = np.quantile(impacts, 0.95)
+
+record_cursor.execute("SELECT field, impact FROM records INNER JOIN record_citations ON records.rowid = record_citations.rowid WHERE impact IS NOT NULL;")
+c = Counter((re.sub('_+', '_', field or 'NA'), impact > impacts_q) for field, impact in tqdm.tqdm(record_cursor, total=total, ncols=100))
+
+c1 = Counter()
+c2 = Counter()
+c1.update({field:count for (field, high_impact), count in c.items() if high_impact})
+c2.update({field:count for (field, high_impact), count in c.items() if not high_impact})
+
+df_counts = pd.DataFrame([(field, count, 'high') for field, count in c1.items()] + [(field, count, 'low') for field, count in c2.items()], columns=['field', 'count', 'impact'])
+
+
+g = sns.catplot(x='count', y='field', col='impact', kind='bar', sharex=False, data=df_counts, order=df_counts.loc[df_counts.impact == 'low'].sort_values(by='count').field)
+g.savefig('fields.pdf', dpi=300)
+plt.close('all')
+
+
+
+
+# impact over time
+total = record_cursor.execute("SELECT COUNT(*) c FROM records INNER JOIN record_citations ON records.rowid = record_citations.rowid WHERE impact IS NOT NULL;").fetchone()[0]
+record_cursor.execute("SELECT records.ROWID, field, year, cited, impact FROM records INNER JOIN record_citations ON records.rowid = record_citations.rowid WHERE field IS NOT NULL AND year >= 1950 AND year <= 2020 AND impact IS NOT NULL;")
+record_iter = ((id, field, year, cited, impact) for id, field, year, cited, impact in record_cursor)
+df_time = pd.DataFrame(tqdm.tqdm(record_iter, total=total, ncols=100), columns=['ID', 'field', 'year', 'cited', 'impact'])
+df_time['high_impact'] = df_time.impact >= impacts_q
+df_time['period'] = pd.cut(df_time.year, np.arange(1950, 2021, 5))
+
+df_time_agg = df_time.groupby(['field', 'year']).agg(
+    paper=('impact', 'count'),
+    impact=('impact', 'mean'),
+    cited=('cited', 'sum')
+).reset_index()
+
+## Landmark paper
+df_landmark = df_time.sort_values('impact', ascending=False).drop_duplicates(['period','field'])
+df_landmark[df_landmark.field == 'Biology'].sort_values(by='year')
+
+record_cursor.execute("SELECT * FROM records WHERE ROWID = 13652797;")
+next(record_cursor)
+# (13652797, '10.1007/BF00840101', 2004, 'Bulletin of Experimental Biology and Medicine', 'Molecular Cloning ( A Laboratory Manual ) , Cold Spring Harbor', None, 'Biology', 'Biology')
+
+record_cursor.execute("SELECT * FROM records WHERE ROWID = 253296167;")
+next(record_cursor)
+# (253296167, '10.1038/227680a0', 1970, 'Nature', 'Cleavage of Structural Proteins during the Assembly of the Head of Bacteriophage T4', None, 'Biology', None)
+
+record_cursor.execute("SELECT * FROM records WHERE ROWID = 90042259;")
+next(record_cursor)
+# (90042259, '10.2142/biophys.39.S54_2', 1999, 'Seibutsu Butsuri', 'Combinatorial receptor codes for odors.', None, 'Biology', 'Biology')
+
+
+
+## normalized paper per field and year
+df_time_agg.pivot(values='impact', index='year', columns='field').head()
+df_time_count = df_time_agg.pivot(values='paper', index='year', columns='field')
+df_time_impact = df_time_agg.pivot(values='impact', index='year', columns='field')
+
+
+## Area of research over time
+df_time_count.apply(lambda x: x/x.sum(), axis=1).plot.area()
+plt.savefig('area_paper.pdf')
+
+
+## Impact of field over time
+df_time_count.apply(lambda x: x/x.sum(), axis=1).plot.area()
+plt.savefig('area_impact.pdf')
+
+
+## citation and impact over time for Biology and Computer Science
+f, ax = plt.subplots(nrows=2, ncols=2, figsize=(8,8))
+_ax = sns.boxplot(x='period', y='cited', fliersize=0.0, data=df_time.loc[df_time.field == 'Biology'], ax=ax[0][0])
+_ax.set_ylim(0, 100)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+_ax.set_title("Biology")
+_ax = sns.boxplot(x='period', y='cited', fliersize=0.0, data=df_time.loc[df_time.field == 'Computer Science'], ax=ax[0][1])
+_ax.set_ylim(0, 100)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+_ax.set_title("Computer Science")
+_ax = sns.boxplot(x='period', y='impact', fliersize=0.0, data=df_time.loc[df_time.field == 'Biology'], ax=ax[1][0])
+_ax.set_ylim(0, 50)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+_ax = sns.boxplot(x='period', y='impact', fliersize=0.0, data=df_time.loc[df_time.field == 'Computer Science'], ax=ax[1][1])
+_ax.set_ylim(0, 50)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+f.savefig("cited_over_time.pdf", dpi=300)
+plt.close('all')
+
+
+## Citation and impact for all fields
+f, ax = plt.subplots(nrows=2, figsize=(16,16))
+_ax = sns.lineplot(x='year', y='cited', hue='field', estimator=None, data=df_time_agg, ax=ax[0])
+_ax = sns.lineplot(x='year', y='impact', hue='field', estimator=None, data=df_time_agg, ax=ax[1])
+_ax.set_ylim(0,20)
+f.savefig("impact_over_time.pdf", dpi=300)
+plt.close('all')
+
+
+
+
+# test citations of impact paper
+## Impact quantiles
+total = record_cursor.execute("SELECT COUNT(*) c FROM record_citations WHERE impact IS NOT NULL;").fetchone()[0]
+record_cursor.execute("SELECT field, impact FROM records JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE field IS NOT NULL AND impact IS NOT NULL;")
+impacts = pd.DataFrame(record_cursor, columns=['field', 'impact'])
+impacts_q = impacts.groupby('field').apply(lambda x : np.quantile(x, 0.95))
+
+## create temporary table with quantiles per field
+record_cursor.execute("""CREATE TEMP TABLE field_impact_threshold (field TEXT NOT NULL, threshold REAL);""")
+_ = [record_cursor.execute("INSERT INTO field_impact_threshold(field, threshold) VALUES('{}', '{}');".format(field, value)) for field, value in impacts_q.iteritems()]
+
+record_cursor.execute("""SELECT records.ROWID FROM records JOIN record_citations ON records.ROWID = record_citations.ROWID JOIN field_impact_threshold ON records.field = field_impact_threshold.field WHERE record_citations.impact > field_impact_threshold.threshold;""")
+impact_paper = set((x[0] for x in record_cursor))
+
+len(impact_paper)
+# 4.048.842
+
+def field_iter(src_ids):
+    src_id_iter = iter(src_ids)
+    for src_id in tqdm.tqdm(src_id_iter, ncols=100, total=len(src_ids)):
+        record_cursor.execute("SELECT cited FROM citations WHERE citing = {};".format(src_id))
+        cited = [x[0] for x in record_cursor]
+        if cited:
+            record_cursor.execute("SELECT field FROM records WHERE ROWID = {};".format(src_id))
+            src_field = record_cursor.fetchone()
+            for c in cited:
+                record_cursor.execute("SELECT field FROM records WHERE ROWID = {};".format(c))
+                target_field = record_cursor.fetchone()
+                if src_field and target_field:
+                    yield src_field[0], target_field[0]
+
+it = field_iter(impact_paper)
+c = Counter(it)
+
+fields = [(src, trgt, count) for (src, trgt), count in c.most_common() if src and trgt]
+
+df_citing = pd.DataFrame(fields, columns=['citing', 'cited', 'citations'])
+df_citing = df_citing.pivot('citing', 'cited')
+df_citing_log = np.log(df_citing)
+
+g = sns.clustermap(df_citing_log, z_score=0, col_cluster=False, row_cluster=True, method='centroid', metric='cosine')
+row_order = g.dendrogram_row.reordered_ind
+g = sns.clustermap(df_citing_log[df_citing_log.columns[row_order]], z_score=0, col_cluster=False, row_cluster=True, method='centroid', metric='cosine', cmap='coolwarm')
+g.savefig('citing.pdf', dpi=300)
+plt.close('all')
+
+
+
+
+# Users and resources for example paper
+nanopolish_doi = '10.1038/nmeth.4184'
+record_cursor.execute("SELECT * FROM records WHERE doi = '{}';".format(nanopolish_doi))
+
+nanopolish_rowid = next(record_cursor)[0]
+
+
+
+
+```

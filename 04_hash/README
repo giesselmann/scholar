@@ -1,0 +1,128 @@
+# activate environment
+source /project/miniondev/virtual/scholar/bin/activate
+
+python3
+```
+import re, gzip
+import tqdm
+import sqlite3
+import numpy as np
+import pandas as pd
+import multiprocessing as mp
+from datasketch import MinHash, LeanMinHash, MinHashLSHForest
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.porter import PorterStemmer
+from nltk.corpus import stopwords
+
+
+# record data base
+#db_file = '../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file, check_same_thread=False)
+cursor = connection.cursor()
+
+
+def get_record(cursor, rowid):
+    title, abstract = cursor.execute("SELECT title, abstract FROM records WHERE rowid = {};".format(rowid)).fetchone()
+    if title and abstract:
+        record = (title or '') + ' ' + (abstract or '')
+        return record
+    else:
+        return None
+
+
+stemmer = PorterStemmer()
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+
+
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+
+en_stop = stopwords.words('english')
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+
+def hash_record(record):
+    m = MinHash(num_perm=128, seed=42)
+    record = re.sub(r'<.*>', '', record)
+    token = tokenize(record)
+    _ = [m.update(t.encode('utf-8')) for t in token if not t in en_stop_token]
+    return m
+
+
+
+
+# PART 1, hash only backbone graph
+## load edges from backbone graph
+df_edges = pd.read_csv('../03_graph/records_1980_20_citations.edges.tsv', sep='\t', names=['citing', 'cited'])
+nodes = df_edges.unstack().unique()
+
+len(nodes)
+# 9.424.639
+
+record_iter = ((rowid,) + get_record(cursor, rowid) for rowid in tqdm.tqdm(nodes, ncols=100))
+hash_iter = ((rowid, hash_record(record).hashvalues) for rowid, record in record_iter if record)
+
+# runs for ~20h on SSD, ~150 it/s
+with gzip.open('records_1980_20_citations_128_hash.tsv.gz', 'wt') as fp:
+    for rowid, hash_values in hash_iter:
+        _ = fp.write('{}\t{}\n'.format(rowid, '\t'.join([str(h) for h in hash_values])))
+
+
+
+
+# PART 2
+## hash all records with title + abstract
+cursor.execute("SELECT rowid FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+rowids = [x[0] for x in cursor]
+record_iter = (get_record(cursor, rowid) for rowid in rowids)
+
+ctx = mp.get_context('spawn')
+
+## runs with ~4-5k it/s
+with ctx.Pool(processes=8) as p, gzip.open('records_128_hash.tsv.gz', 'wt') as fp:
+    hash_iter = p.imap(hash_record, record_iter, chunksize=1000)
+    for rowid, m in tqdm.tqdm(zip(rowids, hash_iter), total=len(rowids), ncols=150, desc='Hashing'):
+        _ = fp.write('{}\t{}\n'.format(rowid, '\t'.join([str(h) for h in m.hashvalues])))
+
+
+
+
+# Load Hashes into MinHash LSH Forest
+lsh = MinHashLSHForest(num_perm=128)
+
+# 10min, requires 20G RAM
+with gzip.open('records_1980_20_citations_128_hash.tsv.gz', 'rt') as fp:
+    def hash_iter(lines):
+        for line in lines:
+            rowid, hashes = line.split('\t', 1)
+            mhash = LeanMinHash(seed=42, hashvalues=[int(x) for x in hashes.split()])
+            yield rowid, mhash
+    for rowid, mhash in tqdm.tqdm(hash_iter(fp), ncols=150, total=len(nodes), desc='Creating MinHash LSH Forest'):
+        lsh.add(rowid, mhash)
+
+
+lsh.index()
+
+
+# test
+doi_STRique = '10.1038/s41587-019-0293-x'
+doi_simpson = '10.1038/nmeth.4184'
+cursor.execute("SELECT title, abstract FROM records WHERE doi = '{}';".format(doi_simpson))
+title, abstract = next(cursor)
+m = hash_record(title, abstract)
+
+for i, rowid in enumerate(lsh.query(m, 50)):
+    if i < 10:
+        cursor.execute("SELECT title FROM records WHERE rowid = {};".format(rowid))
+        print(cursor.fetchone()[0])
+
+
+
+```
+
+zcat records_1980_20_citations_128_hash.tsv.gz | wc -l
+# 6696181

@@ -1,0 +1,1128 @@
+# activate environment
+source /project/miniondev/virtual/scholar/bin/activate
+
+
+python3
+```
+import os, re, io, copy
+import sqlite3
+import tqdm
+import itertools
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+import networkx as nx
+import community as community_louvain
+import seaborn as sns
+import matplotlib.pyplot as plt
+#import matplotlib_venn as mplv
+
+
+
+
+# configure matplotlib
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.cbook as cbook
+from mpl_toolkits.mplot3d import Axes3D
+
+years = mdates.YearLocator()   # every year
+months = mdates.MonthLocator()  # every month
+years_fmt = mdates.DateFormatter('%Y')
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+sns.set(style="ticks")
+
+
+
+
+# open database connection
+# db_file = '../../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+
+
+
+# query long read paper
+title_cmd = """SELECT r.rowid, r.title FROM records r JOIN records_fts5 rf ON r.rowid = rf.rowid LEFT JOIN record_citations rc ON r.rowid = rc.rowid WHERE rc.cited >= 0 AND records_fts5 MATCH '{}' AND year IS NOT NULL AND journal IS NOT 'bioRxiv';"""
+abstract_cmd =  """SELECT r.rowid, r.abstract FROM records r JOIN records_abstract_fts5 rf ON r.rowid = rf.rowid LEFT JOIN record_citations rc ON r.rowid = rc.rowid WHERE rc.cited >= 0 AND records_abstract_fts5 MATCH '{}' AND year IS NOT NULL AND journal IS NOT 'bioRxiv';"""
+
+pacbio_query = 'pacbio OR single molecule real time sequencing'
+nanopore_query = 'nanopore AND sequencing'
+
+# clean up matches due to stemming
+pacbio_filter = lambda x: 'pacbio' in x or re.search(r'single[ -]molecule[ -]real[ -]time[ -]sequencing', x)
+nanopore_filter = lambda x: 'nanopore' in x and 'sequencing' in x
+
+cursor.execute(title_cmd.format(pacbio_query))
+pacbio_seed = {x[0] for x in cursor if pacbio_filter(x[1].lower())}
+cursor.execute(abstract_cmd.format(pacbio_query))
+pacbio_seed.update({x[0] for x in cursor if pacbio_filter(x[1].lower())})
+len(pacbio_seed)
+# 1955
+
+cursor.execute(title_cmd.format(nanopore_query))
+nanopore_seed = {x[0] for x in cursor if nanopore_filter(x[1].lower())}
+cursor.execute(abstract_cmd.format(nanopore_query))
+nanopore_seed.update({x[0] for x in cursor if nanopore_filter(x[1].lower())})
+len(nanopore_seed)
+# 2217
+
+
+
+
+# extend long read cluster
+def seed_extend(cursor, seeds, min_refs=0.3, min_cited=1, max_iter=10, max_size=1e6):
+    seeds = copy.deepcopy(seeds)
+    len_seeds = len(seeds)
+    seed_history = [len_seeds]
+    def extend(seeds, n=20):
+        seeds = list(seeds)
+        for i in range(0, len(seeds), n):
+            s = ','.join([str(x) for x in seeds[i:i+n]])
+            cursor.execute("SELECT rc.rowid, rc.citing FROM citations c JOIN record_citations rc ON c.citing = rc.rowid JOIN records r ON rc.rowid = r.rowid WHERE rc.cited >= {min_cited} AND c.cited IN ({s}) AND r.journal IS NOT 'bioRxiv';".format(min_cited=min_cited, s=s))
+            peers = cursor.fetchall()
+            cursor.execute("SELECT rc.rowid, rc.cited FROM citations c JOIN record_citations rc ON c.cited = rc.rowid JOIN records r ON rc.rowid = r.rowid WHERE rc.cited >= {min_cited} AND c.citing IN ({s}) AND r.journal IS NOT 'bioRxiv';".format(min_cited=min_cited, s=s))
+            peers.extend(cursor.fetchall())
+            yield peers
+    for i in range(max_iter):
+        if len(seeds) >= max_size:
+            return seeds, seed_history
+        # tuples of (rowid, cited)
+        peers = sorted([peer for batch in extend(seeds) for peer in batch], key=lambda x : x[0])
+        # rowids from tuples with count >= min_refs * cited
+        ext = [key[0] for key, g in itertools.groupby(peers) if len(list(g)) >= min_refs * key[1]]
+        seeds.update(ext)
+        #print("Extend step {}: {}".format(i, len(seeds)))
+        seed_history.append(len(seeds))
+        if len(seeds) == len_seeds:
+            return seeds, seed_history
+        else:
+            len_seeds = len(seeds)
+    return seeds, seed_history
+
+
+def seed_extend_iter():
+    max_iter = 20
+    max_size = 2e5
+    min_refs = [0.5, 0.2, 0.1]
+    min_cited = [20, 15, 10, 5, 2]
+    for min_ref in min_refs:
+        for min_cite in min_cited:
+            print("Min. ref {}, min. cited {}".format(min_ref, min_cite))
+            _, pacbio_ext = seed_extend(cursor, pacbio_seed, min_refs=min_ref, min_cited=min_cite, max_iter=max_iter, max_size=max_size)
+            _, nanopore_ext = seed_extend(cursor, nanopore_seed, min_refs=min_ref, min_cited=min_cite, max_iter=max_iter, max_size=max_size)
+            for step, size in enumerate(pacbio_ext):
+                yield 'PacBio', min_ref, min_cite, step, size
+            for step, size in enumerate(nanopore_ext):
+                yield 'Nanopore', min_ref, min_cite, step, size
+
+
+df_seed_extend = pd.DataFrame(seed_extend_iter(), columns=['tec', 'ref', 'cited', 'step', 'size'])
+
+
+# plot convergence
+f, ax = plt.subplots(ncols=2, figsize=(12,6))
+_ax = sns.lineplot(x='step', y='size', hue='ref', style='cited', estimator=None, data=df_seed_extend[df_seed_extend.tec == 'PacBio'], ax=ax[0])
+_ax.set_ylim(2e3, 3e5)
+_ax.set_xlim(0,20)
+_ax.set_yscale('log')
+_ax = sns.lineplot(x='step', y='size', hue='ref', style='cited', estimator=None, data=df_seed_extend[df_seed_extend.tec == 'Nanopore'], ax=ax[1])
+_ax.set_ylim(2e3, 3e5)
+_ax.set_xlim(0,20)
+_ax.set_yscale('log')
+f.savefig('plots/seed_extend_convergence.pdf')
+
+
+
+
+# best combos are:
+# PacBio: 0.2 / 5
+# Nanopore: 0.2 / 5
+pacbio_cluster, pacbio_ext = seed_extend(cursor, pacbio_seed, min_refs=0.2, min_cited=5, max_iter=25, max_size=1e5)
+nanopore_cluster, nanopore_ext = seed_extend(cursor, nanopore_seed, min_refs=0.2, min_cited=5, max_iter=25, max_size=1e5)
+lr_cluster = pacbio_cluster.union(nanopore_cluster)
+len(pacbio_cluster)
+# 4392
+len(nanopore_cluster)
+# 4689
+len(lr_cluster)
+# 8773
+len(pacbio_cluster.intersection(nanopore_cluster))
+# 308
+
+
+
+
+# check overlap with core network
+df_core_edges = pd.read_csv('../../03_graph/records_1980_20_citations.edges.tsv', sep='\t', names=['citing', 'cited'])
+set_core_nodes = set(df_core_edges.unstack().unique())
+len(set_core_nodes.intersection(pacbio_cluster)) / len(pacbio_cluster)
+# 0.0815
+len(set_core_nodes.intersection(nanopore_cluster)) / len(nanopore_cluster)
+# 0.1652
+
+
+
+
+# get all cluster edges
+def get_cluster_edges(cursor, rowids):
+    rowids = list(rowids)
+    # get edges
+    edges = []
+    for i in range(0, len(rowids), 20):
+        cursor.execute("SELECT citing, cited FROM citations WHERE citing IN ({ids}) OR cited IN ({ids});".format(ids=','.join([str(x) for x in rowids[i:i+20]])))
+        edges.extend(cursor.fetchall())
+    return edges
+
+
+pacbio_edges = get_cluster_edges(cursor, pacbio_cluster)
+nanopore_edges = get_cluster_edges(cursor, nanopore_cluster)
+
+
+pacbio_core_edges = [(citing, cited) for citing, cited in pacbio_edges if citing in lr_cluster and cited in lr_cluster]
+nanopore_core_edges = [(citing, cited) for citing, cited in nanopore_edges if citing in lr_cluster and cited in lr_cluster]
+
+
+# Analyze sampled sub-graph
+lr_graph = nx.Graph()
+lr_graph.add_nodes_from(lr_cluster)
+lr_graph.add_edges_from(pacbio_core_edges)
+lr_graph.add_edges_from(nanopore_core_edges)
+
+lr_graph_comp = [lr_graph.subgraph(c).copy() for c in nx.connected_components(lr_graph)]
+lr_graph_comp.sort(key=len, reverse=True)
+lr_graph_comp_len = [len(g) for g in lr_graph_comp]
+lr_graph_comp_ovl = {node for g in lr_graph_comp for node in set_core_nodes.intersection(g.nodes)}
+lr_graph_comp_ovl_len = [len(set_core_nodes.intersection(g.nodes)) for g in lr_graph_comp]
+lr_graph.number_of_nodes()
+# 8773
+lr_graph_comp_len[:5]
+# [7190, 31, 17, 16, 13]
+len(lr_graph_comp_len)
+# 1260
+lr_graph_comp_ovl_len[:5]
+# [1076, 2, 1, 3, 0]
+sum([True for x in lr_graph_comp_ovl_len if x > 0])
+# 14
+
+
+# connect components by random walks in backbone graph
+df_core_edges.shape
+# (166630379, 2)
+
+
+# create undirected edge dictionary
+core_undirected_edges = defaultdict(list)
+for citing, cited in tqdm.tqdm(df_core_edges.itertuples(index=False), total=df_core_edges.shape[0]):
+    core_undirected_edges[citing].append(cited)
+    core_undirected_edges[cited].append(citing)
+
+# random walks between overlapping node
+def random_walk(edge_dict, sources, max_walks=10, max_len=80):
+    def walk(edge_dict, source, max_len=80):
+        p = [source]
+        for _ in range(max_len):
+            source = np.random.choice(edge_dict[source])
+            p.append(source)
+        return p
+    success_walks = []
+    for node in tqdm.tqdm(sources, desc='walking', ncols=150):
+        walks = [walk(core_undirected_edges, node) for _ in range(max_walks)]
+        walks = [list(itertools.dropwhile(lambda x: x not in lr_graph_comp_ovl, w)) for w in walks]
+        walks = [list(itertools.dropwhile(lambda x: x not in lr_graph_comp_ovl, w[::-1])) for w in walks]
+        success_walks.extend([w for w in walks if len(w) > 1])
+    return success_walks
+
+
+lr_graph_comp_walks = random_walk(core_undirected_edges, lr_graph_comp_ovl, max_walks=50, max_len=40)
+
+# sort by number of components connected by walk
+# lr_graph_comp_walks.sort(key = lambda x: sum([len(set(g.nodes).intersection(x)) for g in lr_graph_comp]))
+
+edge_iter = (walk[i:i+2] for walk in lr_graph_comp_walks for i in range(len(walk) - 1))
+
+
+# update graph
+lr_graph_cc = copy.deepcopy(lr_graph)
+lr_graph_cc.add_edges_from(edge_iter)
+lr_graph_cc_comp = [lr_graph_cc.subgraph(c).copy() for c in nx.connected_components(lr_graph_cc)]
+lr_graph_cc_comp_len = sorted([len(g) for g in lr_graph_cc_comp], reverse=True)
+lr_graph_cc.number_of_nodes()
+# 29672
+lr_graph_cc_comp_len[:5]
+# [28178, 13, 12, 11, 10]
+len(lr_graph_cc_comp_len)
+# 1247
+
+
+# stats
+len(lr_cluster.intersection(lr_graph_comp[0].nodes)) / len(lr_cluster)
+# 0.82
+len(lr_cluster.intersection(lr_graph_cc_comp[0].nodes)) / len(lr_cluster)
+# 0.83
+
+len(set(lr_graph.nodes).intersection(lr_graph_comp[0].nodes)) / lr_graph.number_of_nodes()
+# 0.82
+len(set(lr_graph.nodes).intersection(lr_graph_cc_comp[0].nodes)) / lr_graph.number_of_nodes()
+# 0.83
+
+
+# save edges for GraphVite embedding
+#with open('pacbio_nanopore.edges.tsv', 'w') as fp:
+#    fp.write('\n'.join(['\t'.join([str(u), str(v)]) for u, v in lr_graph_comp[0].edges]))
+
+with open('pacbio_nanopore.edges.tsv', 'w') as fp:
+    fp.write('\n'.join(['\t'.join([str(u), str(v)]) for u, v in lr_graph_cc_comp[0].edges]))
+
+
+
+
+# test min hash pseudo edges
+import pyhash
+from datasketch import MinHash, LeanMinHash, MinHashLSHForest
+from nltk.tokenize import RegexpTokenizer
+from nltk.stem.porter import PorterStemmer
+from nltk.corpus import stopwords
+
+
+
+
+def get_record(cursor, rowid):
+    title, abstract = cursor.execute("SELECT title, abstract FROM records WHERE rowid = {};".format(rowid)).fetchone()
+    if title and abstract:
+        record = (title or '') + ' ' + (abstract or '')
+        return record
+    else:
+        return None
+
+
+stemmer = PorterStemmer()
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+
+
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+
+en_stop = stopwords.words('english')
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+
+num_perm = 512
+hasher = pyhash.farm_32()
+
+
+def hash_record(record):
+    m = MinHash(num_perm=num_perm, seed=42, hashfunc=hasher)
+    record = re.sub(r'<.*>', '', record)
+    token = tokenize(record)
+    _ = [m.update(t.encode('utf-8')) for t in token if not t in en_stop_token]
+    return m
+
+
+# hash all records of expanded graph
+record_iter = ((rowid,) + (get_record(cursor, rowid),) for rowid in lr_graph_cc.nodes())
+hash_iter = ((rowid, hash_record(record)) for rowid, record in record_iter if record)
+
+hash_dict = {rowid:mhash for rowid, mhash in tqdm.tqdm(hash_iter, desc='hashing', ncols=150, total=lr_graph_cc.number_of_edges())}
+
+
+# create MinHash forrest
+lsh = MinHashLSHForest(num_perm=num_perm)
+for rowid, mhash in hash_dict.items():
+    lsh.add(rowid, mhash)
+
+
+lsh.index()
+
+# multiply edges from citation graph
+lr_graph_cc.number_of_edges()
+# 70736
+
+# compute similarity of top 500 matches
+sim_iter = ((src_id, trg_id, mhash.jaccard(hash_dict[trg_id])) for src_id, mhash in tqdm.tqdm(hash_dict.items(), ncols=150) for trg_id in lsh.query(mhash, 500) if src_id != trg_id and src_id in lr_cluster)
+
+df_lr_cluster_lsh_edges = pd.DataFrame(sim_iter, columns=['citing', 'cited', 'similarity'])
+df_lr_cluster_lsh_edges.sort_values(by='similarity', inplace=True)
+lr_cluster_lsh_edge_weights = {(citing, cited):similarity for citing, cited, similarity in df_lr_cluster_lsh_edges.itertuples(index=False)}
+
+
+# update to final graph with pseudo edges
+lr_graph_lsh = copy.deepcopy(lr_graph_cc)
+lr_graph_lsh.add_edges_from(df_lr_cluster_lsh_edges.loc[df_lr_cluster_lsh_edges.similarity >= df_lr_cluster_lsh_edges.similarity.quantile(0.80), ['citing', 'cited']].itertuples(index=False))
+lr_graph_lsh_comp = [lr_graph_lsh.subgraph(c).copy() for c in nx.connected_components(lr_graph_lsh)]
+lr_graph_lsh_comp_len = sorted([len(g) for g in lr_graph_lsh_comp], reverse=True)
+lr_graph_lsh.number_of_nodes()
+# 29672
+lr_graph_lsh_comp_len[:5]
+# [29515, 2, 2, 1, 1]
+len(lr_graph_lsh_comp_len)
+# 156
+
+
+
+# write edges
+with open('pacbio_nanopore_lsh.edges.tsv', 'w') as fp:
+    fp.write('\n'.join(['\t'.join([str(u), str(v), str((lr_cluster_lsh_edge_weights.get((u,v)) or lr_cluster_lsh_edge_weights.get((v,u)) or 1.0))]) for u, v in lr_graph_lsh_comp[0].edges]))
+
+
+
+
+# clustering
+#lr_graph_cc_partition = community_louvain.best_partition(lr_graph_cc_comp[0], resolution=2, random_state=42)
+#lr_graph_cc_iter = ((node, lr_graph_cc_partition[node]) for node in lr_graph_cc_comp[0].nodes)
+
+lr_graph_lsh_partition = community_louvain.best_partition(lr_graph_lsh_comp[0], resolution=2, random_state=42)
+lr_graph_lsh_iter = ((node, lr_graph_lsh_partition[node]) for node in lr_graph_lsh_comp[0].nodes)
+
+
+# annotate seed, extension and overlap
+#df_pacbio_nanopore = pd.DataFrame(lr_graph.nodes, columns=['rowid'])
+df_pacbio_nanopore = pd.DataFrame(lr_graph_lsh_iter, columns=['rowid', 'community'])
+df_pacbio_nanopore.loc[:, 'label'] = 'Core_20_Graph'
+df_pacbio_nanopore.loc[df_pacbio_nanopore.rowid.isin(pacbio_cluster), 'label'] = 'PacBio_Ext'
+df_pacbio_nanopore.loc[df_pacbio_nanopore.rowid.isin(nanopore_cluster), 'label'] = 'Nanopore_Ext'
+df_pacbio_nanopore.loc[df_pacbio_nanopore.rowid.isin(pacbio_cluster.intersection(nanopore_cluster)), 'label'] = 'LongRead_Int'
+df_pacbio_nanopore.loc[df_pacbio_nanopore.rowid.isin(pacbio_seed), 'label'] = 'PacBio_Seed'
+df_pacbio_nanopore.loc[df_pacbio_nanopore.rowid.isin(nanopore_seed), 'label'] = 'Nanopore_Seed'
+df_pacbio_nanopore.set_index('rowid').to_hdf('pacbio_nanopore.label.hdf5', 'label')
+
+
+
+
+# paper per year for normalization
+cursor.execute("SELECT year, journal, paper FROM journals WHERE year >= 1950 AND year <= 2020;")
+df_journals = pd.DataFrame(cursor, columns=('year', 'journal', 'paper'))
+df_journal_issues = df_journals.groupby(['year', 'journal']).count().groupby('journal').count()
+df_journals['issues'] = df_journal_issues.loc[df_journals.journal].values
+
+df_journals_agg = df_journals.groupby(['year', 'journal']).agg(
+    paper=('paper', 'sum')
+).reset_index().groupby('year').agg(
+    journals=('journal', 'count'),
+    paper=('paper', 'sum'))
+```
+
+
+
+
+
+
+
+
+
+
+
+# ===============================================================================================
+# ===============================================================================================
+# Embedding on long read subgraph
+# ===============================================================================================
+# ===============================================================================================
+source /project/miniondev/conda/profile3.7
+conda activate graphvite
+
+
+python3
+```
+import os, yaml, pickle
+from easydict import EasyDict
+import numpy as np
+import pandas as pd
+import graphvite as gv
+import graphvite.application as gap
+
+
+with open('graphvite.yaml', "r") as fin:
+    cfg = EasyDict(yaml.safe_load(fin))
+
+
+del cfg['evaluate']; del cfg['load']; del cfg['save']
+
+
+if "optimizer" in cfg.build:
+    cfg.build.optimizer.type = 'RMSprop'
+    cfg.build.optimizer.lr = 1e-3
+    cfg.build.optimizer.weight_decay = 0
+    cfg.build.optimizer.schedule = 'linear'
+    cfg.build.optimizer = gv.optimizer.Optimizer(**cfg.build.optimizer)
+
+
+# common changes
+# number of partitions
+cfg.train.model = 'DeepWalk'
+cfg.resource.gpus = []
+cfg.build.num_partition = 4
+# batch size of samples in CPU-GPU transfer
+cfg.build.batch_size = 100000
+# number of batches in a partition block
+cfg.build.episode_size = 'auto'
+cfg.train.num_epoch = 8000
+cfg.train.shuffle_base = 'auto'
+cfg.train.positive_reuse = 1
+cfg.build.num_negative = 1
+cfg.train.negative_weight = 5.0
+cfg.train.negative_sample_exponent = 0.75
+#  node pairs with distance <= augmentation_step are considered as positive samples
+cfg.train.augmentation_step = 3
+cfg.train.random_walk_length = 80
+cfg.train.log_frequency = 1000
+# auto settings
+cfg = gv.util.recursive_map(cfg, lambda x: gv.auto if x == "auto" else x)
+# update file names
+#cfg.graph.file_name = 'pacbio_nanopore.edges.tsv'
+cfg.graph.file_name = 'pacbio_nanopore_lsh.edges.tsv'
+# cfg.graph.normalization = True
+
+
+# build & configure
+app = gap.Application(cfg.application, **cfg.resource)
+app.set_format(**cfg.format)
+app.load(**cfg.graph)
+# #vertex: 42638, #edge: 99425
+# #vertex: 29515, #edge: 700101
+app.build(**cfg.build)
+
+app.train(**cfg.train)
+
+# save embeddings
+names = np.array(app.graph.id2name).astype(np.int64)
+embeddings = app.solver.vertex_embeddings
+df_emb = pd.DataFrame(embeddings, index=names)
+df_emb.to_hdf('pacbio_nanopore_lsh.emb.hdf5', 'embeddings', 'w')
+del app
+
+```
+
+
+
+
+
+
+# ===============================================================================================
+# ===============================================================================================
+# UMAP & Clustering on long read subgraph
+# ===============================================================================================
+# ===============================================================================================
+# activate environment
+source /project/miniondev/virtual/scholar/bin/activate
+
+
+python3
+```
+import os, re, io, copy, pickle
+import sqlite3
+import tqdm
+import itertools
+import umap
+import umap.plot
+import numpy as np
+import pandas as pd
+import networkx as nx
+import community as community_louvain
+from collections import Counter
+from wordcloud import WordCloud
+from sklearn.preprocessing import quantile_transform
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.cluster import KMeans, MiniBatchKMeans, OPTICS
+from scipy.cluster.hierarchy import dendrogram, linkage
+from yellowbrick.cluster import KElbowVisualizer
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from nltk.tokenize import RegexpTokenizer
+from nltk.corpus import stopwords
+from nltk.stem.porter import PorterStemmer
+
+
+
+# configure matplotlib
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.cbook as cbook
+from mpl_toolkits.mplot3d import Axes3D
+
+years = mdates.YearLocator()   # every year
+months = mdates.MonthLocator()  # every month
+years_fmt = mdates.DateFormatter('%Y')
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+import seaborn as sns
+
+sns.set(style="ticks")
+
+
+# open database connection
+# db_file = '../../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+
+
+
+# PacBio + Nanopore embedding
+## load embeddings
+## order is not guaranteed
+df_emb = pd.read_hdf('pacbio_nanopore_lsh.emb.hdf5')
+
+
+
+## Annotation
+def get_annotation(cursor, rowid):
+    cursor.execute("SELECT year, journal, doi, cited FROM records r LEFT JOIN record_citations rc ON r.rowid = rc.rowid WHERE r.rowid = {};".format(rowid))
+    return next(cursor)
+
+
+df_lr_cluster = pd.read_hdf('pacbio_nanopore.label.hdf5')
+df_lr_cluster = df_lr_cluster[df_lr_cluster.label != 'Core_20_Graph']
+df_lr_cluster = pd.concat([df_lr_cluster, pd.DataFrame([get_annotation(cursor, rowid) for rowid in df_lr_cluster.index.values], columns=['year', 'journal', 'doi', 'cited'], index=df_lr_cluster.index)], axis=1)
+df_lr_cluster['cited_log'] = np.log2(df_lr_cluster.cited + 1)
+df_lr_cluster['cited_q'] = quantile_transform(df_lr_cluster.cited_log.values.reshape(-1,1), n_quantiles=100, copy=True)
+df_lr_cluster.shape
+# (8616, 8)
+
+
+## PCA to 64 dims
+pca = PCA(n_components=40, random_state=42)
+df_emb_pca = pd.DataFrame(pca.fit_transform(df_emb.loc[df_lr_cluster.index]), index=df_lr_cluster.index)
+sum(pca.explained_variance_ratio_)
+# 0.588
+
+
+## UMAP embedding
+# 75, 0.01, correlation
+mapper = umap.UMAP(n_neighbors=25, min_dist=0.01, spread=5.0, metric='correlation', random_state=42, verbose=True).fit(df_emb_pca)
+
+
+## Save/Load PCA & UMAP
+with open('pacbio_nanopore.pca.pkl', 'wb') as fp:
+    pickle.dump(pca, fp)
+
+with open('pacbio_nanopore.umap.pkl', 'wb') as fp:
+    pickle.dump(mapper, fp)
+
+
+with open('pacbio_nanopore.pca.pkl', 'rb') as fp:
+    pca = pickle.load(fp)
+
+with open('pacbio_nanopore.umap.pkl', 'rb') as fp:
+    mapper = pickle.load(fp)
+
+
+df_lr_cluster[['UMAP_1', 'UMAP_2']] = pd.DataFrame(mapper.embedding_, index=df_lr_cluster.index)
+
+
+## CLUSTER
+n_cluster = 24  # was 25
+f, ax = plt.subplots(1, figsize=(20,20))
+# distortion, calinski_harabasz, silhouette
+clust_template = MiniBatchKMeans(batch_size=512, random_state=42)
+visualizer = KElbowVisualizer(clust_template, k=(4,50), metric='distortion', timings=False, ax=ax)
+#visualizer.fit(df_emb_pca)
+visualizer.fit(df_emb_pca.loc[df_lr_cluster.index])
+visualizer.finalize()
+ax.axvline(x=n_cluster)
+f.savefig('plots/pacbio_nanopore.viz.pdf')
+plt.close('all')
+
+
+## Kmeans with optimal k from distortion score
+clust = MiniBatchKMeans(n_clusters=n_cluster, batch_size=512, random_state=42)
+#clust.fit(df_emb_pca)
+clust.fit(df_emb_pca.loc[df_lr_cluster.index])
+#df_lr_cluster['cluster'] = clust.predict(df_emb_pca)
+df_lr_cluster['cluster'] = clust.predict(df_emb_pca.loc[df_lr_cluster.index])
+
+
+
+
+## Cluster of cluster centers
+clust_linkage = linkage(clust.cluster_centers_, method='weighted', metric='euclidean', optimal_ordering=True)
+## Plot Cluster of cluster centers
+f, ax = plt.subplots(1, figsize=(4,8))
+ax.set_title('Hierarchical Clustering Dendrogram')
+ax.set_ylabel('sample index')
+ax.set_xlabel('distance')
+clust_dend = dendrogram(clust_linkage, orientation='left', leaf_font_size=8., ax=ax)
+clust_dend_colors = np.array(clust_dend['leaves_color_list'][::-1])
+f.savefig('plots/pacbio_nanopore.cluster_center.pdf')
+plt.close('all')
+
+
+## Long table to pivot with
+df_lr_cluster_wide = df_lr_cluster.pivot_table(index='cluster', columns='label', values='year', aggfunc=np.count_nonzero, fill_value=0)
+df_lr_cluster_wide['Total'] = df_lr_cluster_wide.sum(axis=1)
+df_lr_cluster_wide['Nanopore'] = df_lr_cluster_wide[['Nanopore_Seed', 'Nanopore_Ext']].sum(axis=1)
+df_lr_cluster_wide['Intersection'] = df_lr_cluster_wide[['LongRead_Int', 'Nanopore']].sum(axis=1)
+df_lr_cluster_wide['PacBio_'] = df_lr_cluster_wide[['PacBio_Ext', 'Intersection']].sum(axis=1)
+
+df_lr_cluster_wide['Ratio'] = df_lr_cluster_wide['Intersection'] / df_lr_cluster_wide['Total']
+df_lr_cluster_wide['Ratio_Bin'] = pd.cut(df_lr_cluster_wide['Ratio'], 4)
+df_lr_cluster_wide['ID'] = [clust_dend['ivl'][::-1].index(str(x)) for x in df_lr_cluster_wide.index.values]
+df_lr_cluster_wide.sort_values(by='ID', inplace=True, ascending=False)
+
+
+# map cluster ID to each node
+df_lr_cluster['ID'] = df_lr_cluster_wide.loc[df_lr_cluster.cluster].ID.values
+
+
+# Uniform color palettes across plots
+# lr_field_palette = sns.color_palette("Spectral_r", 5)
+lr_field_palette = ['lawngreen', 'darkgreen', 'cyan', 'darkblue', 'dodgerblue']
+lr_cluster_palette = (sns.color_palette("tab20b") + sns.color_palette("tab20c"))[:n_cluster]
+
+
+
+
+## plot cluster sizes
+f, ax = plt.subplots(1, figsize=(8,8))
+sns.barplot(y='ID', x='Total', orient='h', label='PacBio Seed', color=lr_field_palette[0], linewidth=0, data=df_lr_cluster_wide)
+sns.barplot(y='ID', x='PacBio_', orient='h', label='PacBio Extension', color=lr_field_palette[1], linewidth=0, data=df_lr_cluster_wide)
+sns.barplot(y='ID', x='Intersection', orient='h', label='Intersection', color=lr_field_palette[2], linewidth=0, data=df_lr_cluster_wide)
+sns.barplot(y='ID', x='Nanopore', orient='h', label='Nanopore Extension', color=lr_field_palette[3], linewidth=0, data=df_lr_cluster_wide)
+sns.barplot(y='ID', x='Nanopore_Seed', orient='h', label='Nanopore Seed', color=lr_field_palette[4], linewidth=0, data=df_lr_cluster_wide)
+ax.legend()
+ax.set_xlabel('Cluster size')
+f.savefig('plots/pacbio_nanopore.cluster_size.pdf')
+plt.close('all')
+
+
+## plot cluster age
+f, ax = plt.subplots(1, figsize=(8,8))
+_ax = sns.boxplot(y="ID", x="year", orient='h', fliersize=0, palette=lr_cluster_palette, data=df_lr_cluster[df_lr_cluster.year >= 1980])
+f.savefig('plots/pacbio_nanopore.cluster_age.pdf')
+plt.close('all')
+
+
+## plot UMAP
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = sns.scatterplot(x='UMAP_1', y='UMAP_2', hue='label', size='cited_q', hue_order=['PacBio_Seed', 'PacBio_Ext', 'LongRead_Int', 'Nanopore_Ext', 'Nanopore_Seed'], marker='.', linewidth=0, alpha=0.8, sizes=(5,75), palette=lr_field_palette, data=df_lr_cluster)
+plt.savefig('plots/pacbio_nanopore.umap.pdf')
+_ax.get_legend().remove()
+#plt.savefig('plots/pacbio_nanopore.umap.png', dpi=300)
+plt.close('all')
+
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = umap.plot.diagnostic(mapper, diagnostic_type='pca')
+plt.savefig('plots/pacbio_nanopore.umap_debug.pdf', dpi=300)
+plt.close('all')
+
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = sns.scatterplot(x='UMAP_1', y='UMAP_2', hue='ID', size='cited_q', marker='.', linewidth=0, alpha=0.8, sizes=(5, 75), palette=lr_cluster_palette, data=df_lr_cluster, ax=ax)
+plt.savefig('plots/pacbio_nanopore.umap_cluster.pdf')
+_ax.get_legend().remove()
+#plt.savefig('plots/pacbio_nanopore.umap_cluster.png', dpi=300)
+plt.close('all')
+
+
+
+
+
+## Wordcloud per cluster
+def get_title_abstract(cursor, rowid):
+    cursor.execute("SELECT title, abstract FROM records WHERE rowid = {};".format(rowid))
+    title, abstract = next(cursor)
+    title = re.sub(r'<.*>', '', title or "")
+    abstract = re.sub(r'<.*>', '', abstract or "")
+    return title, abstract
+
+
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+
+stemmer = PorterStemmer()
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+en_stop = stopwords.words('english')
+
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+vectorizer = TfidfVectorizer(stop_words = en_stop_token, tokenizer = tokenize, min_df=10, max_df=0.2, max_features = 30000)
+title_abstract_iter = (get_title_abstract(cursor, rowid) for rowid in df_lr_cluster.index.values)
+
+# vectorize and annotate columns with vocabulary
+vectorizer_values = vectorizer.fit_transform([' '.join([t, a]) for t, a in title_abstract_iter])
+df_lr_cluster_tfidf = pd.DataFrame(data=vectorizer_values.toarray(), index=df_lr_cluster.index.values, columns=vectorizer.get_feature_names())
+df_lr_cluster_tfidf.shape
+# (8616, 4648)
+
+# sort by most variant token across all paper
+n_variant = 2000
+n_top = 200
+df_lr_cluster_tfidf_var = df_lr_cluster_tfidf.loc[:,df_lr_cluster_tfidf.var(axis=0).sort_values().index.values]
+df_lr_cluster_tfidf_var['__ID'] = df_lr_cluster.ID
+
+
+# mean per cluster, sort columns
+df_lr_cluster_tfidf_var_agg = df_lr_cluster_tfidf_var.groupby('__ID').mean()
+df_lr_cluster_tfidf_var_agg = df_lr_cluster_tfidf_var_agg.loc[:,df_lr_cluster_tfidf_var_agg.var(axis=0).sort_values().tail(n_variant).index.values]
+
+df_lr_cluster_tfidf_var_molten = df_lr_cluster_tfidf_var_agg.reset_index().melt(id_vars='__ID')
+df_lr_cluster_tfidf_var_molten.sort_values(by=['__ID', 'value'], inplace=True, ascending=False)
+
+
+# take first n_top most variant token per cluster
+df_lr_cluster_tfidf_kwds = df_lr_cluster_tfidf_var_molten.groupby('__ID', sort=False).head(n_top).set_index('__ID')
+
+x, y = np.ogrid[:400, :400]
+mask = (x - 200) ** 2 + (y - 200) ** 2 > 200 ** 2
+mask = 255 * mask.astype(int)
+
+# plot WordClouds
+for cluster_id, grp in itertools.groupby(df_lr_cluster_tfidf_kwds.itertuples(), key=lambda x: x[0]):
+    print(cluster_id)
+    wc = WordCloud(background_color="white", repeat=False, mask=mask, width=400, height=400, scale=10.0, random_state=42)
+    wc.generate_from_frequencies({word:tfidf for _, word, tfidf in grp})
+    plt.figure(figsize=(6,6))
+    plt.axis("off")
+    plt.imshow(wc, interpolation="bilinear")
+    plt.savefig('plots/wcs/pacbio_nanopore.wordmap_{}.png'.format(cluster_id), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+
+
+# random test
+doi_STRique = '10.1038/s41587-019-0293-x'
+cursor.execute("SELECT ROWID FROM records WHERE doi = '{}';".format(doi_STRique))
+rowid_STRique = next(cursor)[0]
+df_lr_cluster.loc[rowid_STRique]
+
+doi_nanopype = '10.1093/bioinformatics/btz461'
+cursor.execute("SELECT ROWID FROM records WHERE doi = '{}';".format(doi_nanopype))
+rowid_nanopype = next(cursor)[0]
+df_lr_cluster.loc[rowid_nanopype]
+
+
+
+
+# citation stats per cluster
+df_lr_cluster.groupby('ID').agg(cited_mean=('cited', 'mean'), cited_median=('cited', 'median'))
+#     cited_mean  cited_median
+# ID
+# 0     8.854839           7.5
+# 1     2.557018           0.0
+# 2     2.560748           1.0
+# 3    10.955000           0.0
+# 4     4.008565           3.0
+# 5    10.218487           5.0
+# 6     6.808511           5.0
+# 7     7.598765           6.0
+# 8     6.869919           5.0
+# 9     8.509843           5.0
+# 10    9.874552           5.0
+# 11    7.146154           5.0
+# 12   18.091429           5.0
+# 13   10.042471           5.0
+# 14    9.380165           5.0
+# 15   27.776660           5.0
+# 16   14.354651           6.0
+# 17    8.911330           6.0
+# 18   10.030769           8.0
+# 19   11.700980           9.0
+# 20   14.773333           8.0
+# 21   10.105919           5.0
+# 22   29.005634          10.0
+# 23   32.154696          12.0
+
+
+
+
+# dump most cited paper per year and cluster(-group)
+## adjust IDs as needed!!!
+cluster_content_map = {
+'viral_identification' : [1],
+'strain_assembly' : [2,3,4],
+'strain_resist' : [5,6],
+'transciptomics' : [8,9],
+'microbiomics' : [10],
+'assembly' : [12, 13],
+'clinical_application' : [14],
+'minion' : [15],
+'algorithm' : [16],
+}
+
+
+def get_title(rowid):
+    return cursor.execute("SELECT title FROM records WHERE rowid = {};".format(rowid)).fetchone()[0]
+
+
+for cluster_content, content_ids in cluster_content_map.items():
+    top_k = df_lr_cluster.loc[df_lr_cluster.ID.isin(content_ids) & (df_lr_cluster.year >= 2010)].sort_values(by=['year', 'cited']).groupby('year', sort=False).tail(5)
+    # dump rowid, doi, journal, cited, title into tsv
+    def get_title(rowid):
+        return cursor.execute("SELECT title FROM records WHERE rowid = {};".format(rowid)).fetchone()[0]
+    top_k['title'] = top_k.apply(lambda x : get_title(x.name), axis=1)
+    top_k.to_excel('cluster/{}.xlsx'.format(cluster_content), columns=['doi', 'journal', 'year', 'cited', 'title'])
+
+
+# zoom on 'MinION' cluster
+top_k = df_lr_cluster.loc[df_lr_cluster.ID.isin(cluster_content_map['minion']) & (df_lr_cluster.year >= 2010)].sort_values(by=['year', 'cited']).groupby('year', sort=False).tail(20)
+top_k['title'] = top_k.apply(lambda x : get_title(x.name), axis=1)
+top_k.to_excel('cluster/minion_20.xlsx'.format(cluster_content), columns=['doi', 'journal', 'year', 'cited', 'title'])
+
+
+
+# Continue with cluster of interest around Oxford Nanopore sequencing
+## Check IDs on data/method update!!!
+minion_cluster = [15]
+df_np_cluster = df_lr_cluster[df_lr_cluster.ID.isin(minion_cluster)].copy()
+df_np_cluster.shape
+# (981, 12)
+df_np_cluster[df_np_cluster.label == 'Nanopore_Seed'].shape
+# (556, 12)
+
+
+# Take TF-IDF embedding to cluster based on content
+df_np_cluster_tfidf = df_lr_cluster_tfidf.loc[df_np_cluster.index]
+df_np_cluster_tfidf.shape
+# (981, 4651)
+
+
+# reduce to most variant dimensions
+svd = TruncatedSVD(n_components=256, random_state=42)
+df_np_pca = pd.DataFrame(svd.fit_transform(df_np_cluster_tfidf), index=df_np_cluster.index)
+sum(svd.explained_variance_ratio_)
+# 0.645
+
+
+# combine graph embedding and word embedding into feature matrix
+sum(pca.explained_variance_ratio_[:15])
+# 0.39
+df_np_hybrid = pd.concat([df_np_pca, df_emb_pca.loc[df_np_cluster.index, :15]], axis=1)
+df_np_hybrid.shape
+# (981, 272)
+
+
+# UMAP on TF-IDF embeddings
+mapper2 = umap.UMAP(n_neighbors=15, min_dist=0.0, spread=1.0, metric='correlation', random_state=42, verbose=True).fit(df_np_hybrid)
+
+
+df_np_cluster[['UMAP_1', 'UMAP_2']] = pd.DataFrame(mapper2.embedding_, index=df_np_cluster.index)
+df_np_cluster['cited_clip'] = np.clip(df_np_cluster.cited, 0, df_np_cluster.cited.quantile(0.95))
+
+
+
+
+# find communities using louvain on sub-graph
+df_np_nodes = set(df_np_cluster.index.values)
+np_edge_iter = ((citing, cited) for node in df_np_nodes for citing, cited in
+cursor.execute("SELECT citing, cited FROM citations WHERE citing = {r} OR cited = {r}".format(r=node)).fetchall() if citing in df_np_nodes and cited in df_np_nodes)
+
+np_graph = nx.Graph()
+np_graph.add_edges_from(np_edge_iter)
+
+np_graph_comp = [np_graph.subgraph(c).copy() for c in nx.connected_components(np_graph)]
+np_graph_comp_len = sorted([len(g) for g in np_graph_comp], reverse=True)
+np_graph.number_of_nodes()
+# 759
+np_graph_comp_len[:5]
+# [725, 4, 3, 3, 2]
+len(np_graph_comp_len)
+# 16
+
+# update ID from louvain clustering
+np_graph_partition = community_louvain.best_partition(np_graph, resolution=1, random_state=42)
+df_np_cluster['ID'] = [np_graph_partition.get(rowid) for rowid in df_np_cluster.index.values]
+
+
+np_cluster_n = df_np_cluster.dropna()['ID'].unique().shape[0]
+np_cluster_palette = (sns.color_palette("tab20b") + sns.color_palette("tab20c"))[:np_cluster_n]
+
+
+## plot UMAP
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = sns.scatterplot(x='UMAP_1', y='UMAP_2', hue='ID', size='cited_clip', marker='.', linewidth=0, alpha=0.95, sizes=(25,200), palette=np_cluster_palette, data=df_np_cluster)
+plt.savefig('plots/nanopore.umap.pdf')
+#_ax.get_legend().remove()
+#plt.savefig('plots/nanopore.umap.png', dpi=300)
+plt.close('all')
+
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = umap.plot.diagnostic(mapper2, diagnostic_type='pca')
+plt.savefig('plots/nanopore.umap_debug.pdf', dpi=300)
+plt.close('all')
+
+
+
+
+df_np_cluster.groupby('ID').agg(count=('year', 'count'), pub=('year', 'mean'))
+# count          pub
+# ID
+# 0.0      22  2017.363636
+# 1.0      12  2018.500000
+# 2.0       5  2011.400000
+# 3.0     110  2018.436364
+# 4.0      54  2017.777778
+# 5.0     134  2016.694030
+# 6.0      18  2017.444444
+# 7.0      92  2017.956522
+# 8.0      13  2016.384615
+# 9.0      49  2017.367347
+# 10.0     10  2016.300000
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Simpson vs Rand
+## Test methods on similar content but different success
+## Simpson et al.
+## Detecting DNA cytosine methylation using nanopore sequencing
+## 11k Accesses 224 Citations 288 Altmetric
+doi_simpson = '10.1038/nmeth.4184'
+
+cursor.execute("SELECT ROWID FROM records WHERE doi = '{}';".format(doi_simpson))
+rowid_simpson = next(cursor)[0]
+
+## Rand et al.
+## Mapping DNA methylation with high-throughput nanopore sequencing
+## 4887 Accesses 153 Citations 126 Altmetric
+doi_rand = '10.1038/nmeth.4189'
+
+cursor.execute("SELECT ROWID FROM records WHERE doi = '{}';".format(doi_rand))
+rowid_rand = next(cursor)[0]
+
+
+## citing simpson
+cursor.execute("SELECT records.rowid, year, journal, record_citations.cited, title, abstract FROM records JOIN citations ON records.rowid = citations.citing LEFT JOIN record_citations ON records.rowid = record_citations.rowid WHERE citations.cited = {} AND year is NOT NULL and journal IS NOT NULL;".format(rowid_simpson))
+
+df_citing_simpson = pd.DataFrame(cursor, columns=['rowid', 'year', 'journal', 'cited', 'title', 'abstract'])
+
+## citing rand
+cursor.execute("SELECT records.rowid, year, journal, record_citations.cited, title, abstract FROM records JOIN citations ON records.rowid = citations.citing LEFT JOIN record_citations ON records.rowid = record_citations.rowid WHERE citations.cited = {} AND year is NOT NULL and journal IS NOT NULL;".format(rowid_rand))
+
+df_citing_rand = pd.DataFrame(cursor, columns=['rowid', 'year', 'journal', 'cited', 'title', 'abstract'])
+
+df_citing = pd.concat([df_citing_simpson.assign(target='simpson'), df_citing_rand.assign(target='rand')])
+
+
+## journal paper
+cursor.execute("SELECT year, journal FROM records WHERE rowid = {};".format(rowid_simpson))
+# 2017, 'Nature Methods'
+
+cursor.execute("SELECT cited FROM records LEFT JOIN record_citations ON records.rowid = record_citations.rowid WHERE journal = 'Nature Methods' AND year = 2017;")
+df_nm_2017_cited = pd.DataFrame(cursor, columns=['cited'])
+
+
+## overlap of simpson/rand citing publications
+df_citing_overlap = df_citing.groupby(['rowid', 'target']).size().unstack(fill_value=0).astype(bool)
+df_citing_overlap.groupby(['rand', 'simpson']).size()
+# rand   simpson
+# False  True       89
+# True   False      36
+#        True       92
+# dtype: int64
+
+
+## plots
+f, ax = plt.subplots(ncols=3, figsize=(15,5))
+_ax = sns.countplot(x='year', hue='target', data=df_citing[df_citing.year >= 2017], ax=ax[0])
+_ax.set_title('Citations per year')
+_ax = sns.histplot(x="cited", stat='count', element='step', data=df_nm_2017_cited, ax=ax[1])
+_ax.set_title('Nature Methods 2017 publications (n={})'.format(df_nm_2017_cited.shape[0]))
+_ax.set_xscale('log')
+#_ax.axvline(df_nm_2017_cited.cited.median(), color='k', label='median')
+_ax.axvline(df_citing_rand.shape[0], color='b', label='Rand et al.')
+_ax.axvline(df_citing_simpson.shape[0], color='r', label='Simpson et al.')
+_ax.legend()
+f.sca(ax[2])
+mplv.venn2(subsets = (89, 36, 92), set_labels = ('Simpson et al.', 'Rand et al.'))
+plt.show()
+
+
+
+
+## most common citations from simpson/rand citing publications
+# cursor.execute("SELECT r.rowid, year, journal, title FROM records r JOIN citations c ON r.rowid = c.citing WHERE r.rowid IN ({});".format(','.join([str(s) for s in df_citing.rowid])))
+# finds euskirchen brain tumor stuff...
+
+
+cursor.execute("SELECT r.rowid, year, journal, title FROM records r JOIN citations c ON r.rowid = c.cited WHERE c.citing IN ({});".format(','.join([str(s) for s in df_citing.rowid])))
+
+df_cited = pd.DataFrame(cursor, columns=['rowid', 'year', 'journal', 'title'])
+df_cited.shape
+# 14811, 4
+
+df_cited_agg = df_cited.groupby('rowid').agg(
+    year=('year', 'first'),
+    journal=('journal', 'first'),
+    title=('title', 'first'),
+    referenced=('year', 'count')
+).reset_index().sort_values(by='referenced')
+
+
+
+
+# Ppaer for selected keywords over time
+def get_paper_by_keywords(kwds, filter_fn = lambda x : True):
+    sql_command = """SELECT records.rowid, year, records.title FROM records JOIN records_fts5 ON records.rowid = records_fts5.rowid WHERE records_fts5 MATCH '{}' AND YEAR IS NOT NULL;""".format(kwds)
+    cursor.execute(sql_command)
+    df_title = pd.DataFrame([(rowid, year) for rowid, year, title in cursor if filter_fn(title.lower())], columns=['rowid', 'year'])
+    sql_command = """SELECT records.rowid, year, records.abstract FROM records JOIN records_abstract_fts5 ON records.rowid = records_abstract_fts5.rowid WHERE records_abstract_fts5 MATCH '{}' AND YEAR IS NOT NULL;""".format(kwds)
+    cursor.execute(sql_command)
+    df_abstract = pd.DataFrame([(rowid, year) for rowid, year, abstract in cursor if filter_fn(abstract.lower())], columns=['rowid', 'year'])
+    df = pd.concat([df_title.assign(source='title'), df_abstract.assign(source='abstract')])
+    return df.assign(kwds=kwds)
+
+
+# Find paper by keywords
+## nanopore sequencing
+df_nanopore = get_paper_by_keywords('nanopore AND sequencing', filter_fn = lambda x : 'nanopore' in x and 'sequencing' in x)
+
+## imprinting
+df_imprint = get_paper_by_keywords('imprinting', filter_fn = lambda x : 'imprinting' in x)
+
+## methylation
+df_methylation = get_paper_by_keywords('dna AND methylation', filter_fn = lambda x : 'dna' in x and 'methylation' in x)
+
+## chromosome inactivation
+df_chr = get_paper_by_keywords('chromosome AND inactivation', filter_fn = lambda x : 'chromosome' in x and 'inactivation' in x)
+
+## histone
+df_histone = get_paper_by_keywords('histone', filter_fn = lambda x : 'histone' in x)
+
+
+df_kwds = pd.concat([df_nanopore, df_imprint, df_methylation, df_chr, df_histone])
+df_kwds_agg = df_kwds.drop_duplicates(subset=['rowid', 'kwds']).groupby(['year', 'kwds']).agg(
+    paper=('rowid', 'count'))
+# fill missing values
+df_kwds_agg = df_kwds_agg.unstack(fill_value=0).stack().reset_index()
+df_kwds_agg['PPM'] = df_kwds_agg.paper / df_journals_agg.loc[df_kwds_agg.year].paper.values * 1e6
+df_kwds_agg = df_kwds_agg.dropna().reset_index(drop=True).sort_values(by='year')
+
+df_kwds_agg['PPM_smooth'] = df_kwds_agg.groupby('kwds').rolling(3)['PPM'].mean().reset_index('kwds', drop=True)
+
+
+## paper over time
+f, ax = plt.subplots(1, figsize=(8,8))
+#sns.lineplot(data=df_kwds_agg, x="year", y='PPM', hue='kwds', drawstyle='steps-pre', ax=ax)
+sns.lineplot(data=df_kwds_agg, x="year", y='PPM_smooth', hue='kwds', ax=ax)
+ax.set_xlim(1949, 2021)
+f.savefig('plots/nanopore_time.pdf')
+plt.close('all')
+
+
+
+
+```

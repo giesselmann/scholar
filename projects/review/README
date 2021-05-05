@@ -1,0 +1,431 @@
+# ideas
+list top cited papers per time-frame
+1st class paper come out, instant citation "one hit wonder"
+2nd class paper come out, constant level of citation "constant impact"
+
+One thing we would like to check is how much of a review is actually "new" (compared to the last landmark review) and how much knowledge is simply repeated. For that, we would like to compare the reference cited in each most highly cited paper in each decade (or maybe every 5 years) and quantify their overlap with the review from the previous decade(s). It would also be interesting to see what percentage of references in each review is from the first 5, 10, 15, ... years prior to the publication date of each review.
+
+
+
+
+## lookup most DOIs, complement by manual search
+python3
+```
+import re
+import sqlite3
+import pandas as pd
+from fuzzywuzzy import fuzz
+
+
+# load paper titles
+df_files = ['tables/1900-1969.xlsx', 'tables/1970-1979.xlsx', 'tables/1980-1989.xlsx', 'tables/1990-1999.xlsx', 'tables/2000-2009.xlsx', 'tables/2010-2020.xlsx']
+df_paper = pd.concat([pd.read_excel(f, sheet_name='Sheet1', header=0, na_filter=False, usecols=['doi', 'title', 'year', 'month', 'day']).assign(file=f) for f in df_files])
+
+
+# open sqlite connection
+db_file = '../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+
+# find paper by title
+def lookup_title(title):
+    sql_title = ' '.join([x.lower() for x in re.split(r'[^A-Za-z0-9]', title) if x])
+    cursor.execute("""SELECT records.title, doi FROM records JOIN records_fts5 ON records.rowid = records_fts5.rowid WHERE records_fts5 MATCH '{}';""".format(sql_title))
+    result = cursor.fetchone()
+    match, doi = result if result else ('', '')
+    return title, match, doi
+
+# list of titles or empty strings
+t = [lookup_title(t) if t else ('', '', '') for t in df_paper.title]
+
+# fuzzy string matching
+u = [fuzz.ratio(a.lower(), b.lower()) > 98 and abs(len(a) - len(b)) < 0.1 * min(len(a), len(b)) for a, b, _ in t]
+
+sum(u)/len(u)
+# 0.69
+
+# write back lookup
+df_paper['doi'] = [t[2] if u else '' for u, t in zip(u, t)]
+_ = [df_paper.loc[df_paper.file == f].to_excel(re.sub('.xlsx', '.doi.xlsx', f), index=False) for f in df_files]
+
+
+# read back DOIs and compare titles missing in first round
+def lookup_doi(doi):
+    cursor.execute("SELECT title FROM records WHERE doi ='{}';".format(doi))
+    return cursor.fetchone() or (None, )
+
+t2 = [(doi, lookup_doi(doi)[0]) for doi in df_paper.doi]
+
+len(t2)
+# 847
+
+len([x for x in t2 if x[0]])
+# 764
+
+t_miss = [(xlsx_title, db_title) for (doi, db_title), (xlsx_title, match_title, db_doi), u in zip(t2, t, u) if doi and not u]
+
+with open('miss.txt', 'w') as fp:
+    fp.write('\n\n'.join(['\n'.join([str(t1), str(t2)]) for t1, t2 in t_miss]))
+```
+
+
+
+
+python3
+```
+import os, re, io
+import sqlite3
+import tqdm
+import imageio
+import umap
+import umap.plot
+import itertools
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from PIL import Image
+from pygifsicle import optimize
+from fuzzywuzzy import fuzz
+from datasketch import MinHash
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.cluster import KMeans, DBSCAN, OPTICS
+from nltk.tokenize import RegexpTokenizer
+from nltk.corpus import stopwords
+from nltk.stem.porter import PorterStemmer
+
+
+
+
+# configure matplotlib
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.cbook as cbook
+from mpl_toolkits.mplot3d import Axes3D
+
+years = mdates.YearLocator()   # every year
+months = mdates.MonthLocator()  # every month
+years_fmt = mdates.DateFormatter('%Y')
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+sns.set(style="white", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+
+
+
+# load paper titles
+df_files = ['tables/1900-1969.xlsx', 'tables/1970-1979.xlsx', 'tables/1980-1989.xlsx', 'tables/1990-1999.xlsx', 'tables/2000-2009.xlsx', 'tables/2010-2020.xlsx']
+df_paper = pd.concat([pd.read_excel(f, sheet_name='Sheet1', header=0, na_filter=False, usecols=['doi', 'title', 'year', 'month', 'day']).assign(file=f) for f in df_files])
+
+
+# open sqlite connection
+db_file = '../../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+
+
+
+# find record by doi
+def lookup_doi(doi):
+    cursor.execute("SELECT records.ROWID, records.journal, records.year, title, record_citations.cited, journals.cited_mean from records LEFT JOIN record_citations ON records.ROWID = record_citations.ROWID JOIN journals ON records.journal = journals.journal AND records.year = journals.year WHERE doi = '{}';".format(doi))
+    return (doi, ) + (cursor.fetchone() or (None, ) * 6)
+
+it = (lookup_doi(doi) for doi in df_paper.doi if doi)
+df = pd.DataFrame([record for record in it if record[1]], columns=['doi', 'rowid', 'journal', 'year', 'title', 'citations', 'cited_mean'])
+df['period'] = pd.cut(df.year, [1900, 1940] + list(np.arange(1950, 2021, 10)))
+
+# journal frequency
+df_agg_journal = df.groupby('journal').agg(paper=('title', 'count')).reset_index().sort_values(by='paper')
+df_agg_journal['label'] = df_agg_journal.journal
+df_agg_journal.loc[df_agg_journal.paper <= df_agg_journal.iloc[-11].paper, 'label'] = 'other'
+df_agg_journal.set_index('journal', inplace=True)
+
+# paper in same journal and year
+def get_journal_peers(year, journal):
+    cursor.execute("SELECT records.year, record_citations.cited FROM records LEFT JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE records.year = {} AND records.journal = '{}';".format(year, journal))
+    return [x for x in cursor]
+
+df_peers_journal = pd.DataFrame([(year, cited) for record in df.itertuples() for year, cited in get_journal_peers(record.year, record.journal)], columns=['year', 'journal'])
+
+
+# paper cited
+def get_cited_peers(rowid):
+    cursor.execute("SELECT records.rowid, records.year, record_citations.cited FROM citations JOIN records ON citations.cited = records.ROWID LEFT JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE citations.citing = {};".format(rowid))
+    return [(x[0], x[1], x[2] or 0) for x in cursor]
+
+df_peers_cited = pd.DataFrame([(record.year, year, record.rowid, rowid, cited) for record in df.itertuples() for rowid, year, cited in get_cited_peers(record.rowid)], columns=['year', 'year_cited', 'rowid_citing', 'rowid_cited', 'cited'])
+
+df_peers_cited['period'] = pd.cut(df_peers_cited.year, [1900, 1940] + list(np.arange(1950, 2021, 10)))
+df_peers_cited['lookback'] = df_peers_cited.year_cited - df_peers_cited.year
+
+# paper citing
+def get_citing_peers(rowid):
+    cursor.execute("SELECT records.rowid, records.year, record_citations.cited FROM citations JOIN records ON citations.citing = records.ROWID LEFT JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE records.year IS NOT NULL AND citations.cited = {};".format(rowid))
+    return [(x[0], x[1], x[2] or 0) for x in cursor]
+
+df_peers_citing = pd.DataFrame([(record.year, year, rowid, record.rowid, citing) for record in df.itertuples() for rowid, year, citing in get_citing_peers(record.rowid)], columns=['year', 'year_citing', 'rowid_citing', 'rowid_cited', 'citing'])
+
+
+df_peers = pd.concat([df_peers_journal.melt(id_vars='year', value_vars='journal'), df_peers_cited.melt(id_vars='year', value_vars='cited'), df_peers_citing.melt(id_vars='year', value_vars='citing'), df[['year', 'citations']].melt(id_vars='year', value_vars='citations')])
+df_peers['period'] = pd.cut(df_peers.year, [1900, 1940] + list(np.arange(1950, 2021, 10)))
+df_peers['log citations'] = np.log10(df_peers.value + 1)
+
+
+
+
+# MinHash
+n_hashes = 256
+def hash_record(rowid):
+    cursor.execute("SELECT title, abstract FROM records WHERE ROWID={};".format(rowid))
+    title, abstract = next(cursor)
+    if not abstract:
+        return None
+    m = MinHash(num_perm=n_hashes, seed=42)
+    token = ' '.join([title or '', abstract or '']).lower().split()
+    _ = [m.update(t.encode('utf-8')) for t in token]
+    return m
+
+it = ((rowid, hash_record(rowid)) for rowid in tqdm.tqdm(np.concatenate([df.rowid.unique(), df_peers_cited.loc[df_peers_cited.cited > 100].rowid_cited.unique()]), ncols=100))
+peers_cited_hash_dict = {rowid:m for rowid, m in it if m}
+
+rowids = [rowid for rowid in df.rowid.unique() if rowid in peers_cited_hash_dict]
+colids = [colid for colid in df_peers_cited.loc[df_peers_cited.cited > 100].rowid_cited.unique() if colid in peers_cited_hash_dict]
+df_peers_cited_jarcard = pd.DataFrame([[rowid] + [peers_cited_hash_dict[colid].jaccard(peers_cited_hash_dict[rowid]) for colid in colids] for rowid in tqdm.tqdm(rowids, ncols=100)], columns=['rowid'] + colids)
+
+
+
+
+# Vectorize
+np.random.seed(42)
+stemmer = PorterStemmer()
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+en_stop = stopwords.words('english')
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+
+
+
+vectorizer = TfidfVectorizer(stop_words = en_stop_token, tokenizer = tokenize, min_df=10, max_df=0.66, max_features = 10000)
+def get_title_abstract(rowid):
+    cursor.execute("SELECT title, abstract FROM records WHERE ROWID={};".format(rowid))
+    title, abstract = next(cursor)
+    return rowid, title or '', abstract or ''
+
+it = (get_title_abstract(rowid) for rowid in df.rowid)
+data_idx, data_txt = zip(*[(rowid, (title, abstract)) for rowid, title, abstract in it])
+vectorizer_values = vectorizer.fit_transform([' '.join([title, abstract]) for title, abstract in data_txt])
+
+# check some tf-idf
+vectorizer.idf_[vectorizer.get_feature_names().index('methyl')]
+# 1.417
+vectorizer.idf_[vectorizer.get_feature_names().index('oncogen')]
+# 5.238
+
+
+svd = TruncatedSVD(n_components=128, random_state=42)
+vectorizer_pca = np.ascontiguousarray(svd.fit_transform(vectorizer_values))
+
+
+clust = KMeans(init='k-means++', n_clusters=16, n_init=50, precompute_distances=True, n_jobs=16)
+clust.fit(vectorizer_pca)
+cluster = clust.labels_
+labels = clust.labels_
+
+
+df_cluster = pd.DataFrame(vectorizer_values.toarray(), columns=vectorizer.get_feature_names())
+df_cluster['_cluster'] = cluster
+df_cluster.set_index('_cluster', inplace=True)
+
+df_cluster_agg = df_cluster.groupby('_cluster').sum()
+
+cluster_id, word_id = np.nonzero(df_cluster_agg.ge(df_cluster_agg.quantile(0.99, axis=1), axis=0).to_numpy())
+
+cluster_words = {c:' '.join([df_cluster.columns[w] for _, w in ws]) for c, ws in itertools.groupby(zip(cluster_id, word_id), key=lambda x : x[0])}
+cluster_center = df.groupby('cluster').agg(center=('year', 'mean'))
+
+
+print("Explained variance:", svd.explained_variance_ratio_.sum())
+# Explained variance: 0.647
+
+
+mapper = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=666, verbose=True).fit(vectorizer_values)
+mapper_3d = umap.UMAP(n_components=3, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=666, verbose=True).fit(vectorizer_values)
+
+
+df = df.assign(umap1 = mapper.embedding_[:,0], umap2 = mapper.embedding_[:,1], cluster=cluster)
+df['cluster_center'] = df.groupby('cluster').transform('mean')['year']
+df_3d = df.copy().assign(umap1=mapper_3d.embedding_[:,0], umap2=mapper_3d.embedding_[:,1], umap3=mapper_3d.embedding_[:,2], cluster=cluster)
+
+
+
+
+# expand reading list by common citations
+
+
+
+
+
+# plots
+## number of papers per period
+f, ax = plt.subplots(1, figsize=(8,4))
+_ax = sns.countplot(x="period", data=df, ax=ax)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+plt.tight_layout()
+f.savefig('plots/paper.pdf')
+plt.close('all')
+
+
+
+
+# top 10 journals in review list
+f, ax = plt.subplots(1, figsize=(8,4))
+_ax = sns.countplot(y='label', data=df_agg_journal.loc[df.journal].sort_values(by='paper'))
+plt.tight_layout()
+f.savefig('plots/journals.pdf')
+plt.close('all')
+
+
+
+
+# citations of journal, cited, citing and review paper
+f, ax = plt.subplots(nrows=2, figsize=(8,8))
+hue_order=['journal', 'citing', 'cited', 'citations']
+_ax = sns.boxplot(x='period', y='log citations', hue='variable', hue_order=hue_order, fliersize=0, data=df_peers, ax=ax[0])
+_ax.set_ylim(0, 5)
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+_ax = sns.countplot(x='period', hue='variable', hue_order=hue_order, data=df_peers, ax=ax[1])
+_ax.set_yscale("log")
+_ax.set_xticklabels(_ax.get_xticklabels(), rotation=45, horizontalalignment='right')
+plt.tight_layout()
+f.savefig('plots/cited.pdf')
+plt.close('all')
+
+
+
+
+# lookback time of review paper
+pal = sns.cubehelix_palette(8, rot=-.25, light=.7)
+g = sns.FacetGrid(df_peers_cited, row="period", hue="period", sharey=False, aspect=15, height=.5, palette=pal)
+
+g.map(sns.kdeplot, "year_cited", clip_on=False, shade=True, alpha=1, lw=1.5, bw=1)
+g.map(sns.kdeplot, "year_cited", clip_on=False, color="w", lw=2, bw=1)
+g.map(plt.axhline, y=0, lw=2, clip_on=False)
+
+def label(x, color, label):
+    ax = plt.gca()
+    ax.text(0, .5, label, fontweight="bold", color=color,
+            ha="left", va="center", transform=ax.transAxes)
+
+g.map(label, "year_cited")
+
+g.fig.subplots_adjust(hspace=-.25)
+g.set_titles("")
+g.set(yticks=[])
+#g.set(xlim=(-20,0))
+g.despine(bottom=True, left=True)
+g.savefig('plots/lookback.pdf')
+plt.close('all')
+
+
+
+
+# UMAP
+f, ax = plt.subplots(1, figsize=(10,10))
+#_ax = sns.scatterplot(x='umap1', y='umap2', hue='year', size='log_citations', sizes=(20, 200), data=df.assign(log_citations=np.log10(df.citations + 1)), ax=ax, background='black')
+
+cmap = sns.blend_palette(['red', 'yellow'], as_cmap=True)
+cmap = sns.blend_palette(['blue', 'purple', 'red', 'yellow'], n_colors=df.period.unique().shape[0])
+_ax = sns.scatterplot(x='umap1', y='umap2', hue='period', size=20, alpha=0.8, palette=cmap, data=df, ax=ax, linewidth=0)
+_ax.set_facecolor('black')
+f.savefig('plots/umap.pdf')
+plt.close('all')
+
+
+
+
+# 3D UMAP
+f = plt.figure(figsize=(8,8))
+ax = f.add_subplot(111, projection='3d')
+cmap = sns.blend_palette(['blue', 'purple', 'red', 'yellow'], as_cmap=True)
+ax.scatter(df_3d.umap2, df_3d.umap3, df_3d.umap1, c=df_3d.year.astype(np.float), cmap=cmap, s=10 * np.clip(df_3d.citations.values / df_3d.citations.quantile(0.95), 0, df_3d.citations.quantile(0.97)), marker='.', alpha=0.8, depthshade=True)
+ax.w_xaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.w_yaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.w_zaxis.set_pane_color((1.0, 1.0, 1.0, 0.0))
+ax.grid(False)
+ax.axis('off')
+#ax.set_xlabel('umap2')
+#ax.set_ylabel('umap3')
+ax.set_facecolor('black')
+f.savefig('plots/umap3d.png')
+plt.close('all')
+
+with imageio.get_writer('plots/umap3d.gif', mode='I', duration=.1) as writer:
+    for angle in tqdm.tqdm(range(0, 360, 1), ncols=100, desc='rotation'):
+        fp = io.BytesIO()
+        ax.view_init(20, angle)
+        plt.draw()
+        f.savefig(fp, format='png', dpi=600, facecolor='black', bbox_inches='tight', pad_inches=0)
+        _ = fp.seek(0)
+        writer.append_data(imageio.imread(fp, format='png'))
+
+plt.close('all')
+optimize('plots/umap3d.gif')
+
+
+
+
+# UMAP cluster
+f, ax = plt.subplots(1, figsize=(10,10))
+cmap = sns.blend_palette(['red', 'yellow', 'lime', 'cyan', 'blue', 'magenta'], n_colors=df.cluster.unique().shape[0])
+#cmap = sns.color_palette("Paired", n_colors=df.cluster.unique().shape[0])
+_ax = sns.scatterplot(x='umap1', y='umap2', hue='cluster', size=20, alpha=0.8, palette=cmap, data=df, ax=ax, linewidth=0)
+_ax.set_facecolor('black')
+f.savefig('plots/umap_cluster.pdf')
+plt.close('all')
+
+
+
+
+# timeline
+levels = np.tile([-7, 7, -5, 5, -3, 3, -1, 1], int(np.ceil(len(cluster_center)/8)))[:len(cluster_center)]
+names = [cluster_words[x] for x in cluster_center.index.values]
+
+# Create figure and plot a stem plot with the date
+f, ax = plt.subplots(figsize=(24, 4), constrained_layout=True)
+ax.set(title="DNA methylation timeline")
+
+markerline, stemline, baseline = ax.stem(cluster_center.center, levels, linefmt="C3-", basefmt="k-", use_line_collection=True)
+
+plt.setp(markerline, mec="k", mfc="w", zorder=3)
+
+# Shift the markers to the baseline by replacing the y-data by zeros.
+markerline.set_ydata(np.zeros(len(cluster_center)))
+
+# annotate lines
+vert = np.array(['top', 'bottom'])[(levels > 0).astype(int)]
+for d, l, r, va in zip(cluster_center.center.values, levels, names, vert):
+    ax.annotate(r, xy=(d, l), xytext=(-3, np.sign(l)*3),
+                textcoords="offset points", va=va, ha="right")
+
+# remove y axis and spines
+ax.get_yaxis().set_visible(False)
+for spine in ["left", "top", "right"]:
+    ax.spines[spine].set_visible(False)
+
+f.savefig('plots/timeline.pdf')
+plt.close('all')
+```

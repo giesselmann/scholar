@@ -1,0 +1,460 @@
+python3
+```
+import os, sys, glob
+import gzip, re, json
+import sqlite3
+import tqdm
+import math
+import datetime
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from collections import Counter
+from datasketch import MinHash
+
+import matplotlib
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import matplotlib.cbook as cbook
+
+
+
+
+# configure matplotlib
+years = mdates.YearLocator()   # every year
+months = mdates.MonthLocator()  # every month
+years_fmt = mdates.DateFormatter('%Y')
+
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+sns.set(style="ticks", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+
+#db_file = '../../01_database/scholar.db'
+db_file_scholar = '/scratch/local2/giesselm/scholar/scholar.db'
+
+#db_file = '../../01_database/bioRxiv.db'
+db_file_bioRxiv = '/scratch/local2/giesselm/scholar/bioRxiv.db'
+
+
+# open main and bioRxiv databases
+conn_scholar = sqlite3.connect(db_file_scholar)
+cursor_scholar = conn_scholar.cursor()
+
+conn_bioRxiv = sqlite3.connect(db_file_bioRxiv)
+cursor_bioRxiv = conn_bioRxiv.cursor()
+
+
+
+
+# read bioRxiv into memory
+cursor_bioRxiv.execute("SELECT year, month, day, field, published FROM records;")
+df_bioRxiv = pd.DataFrame([(datetime.datetime(year=year, month=month, day=day), field, published) for year, month, day, field, published in cursor_bioRxiv], columns=['date', 'field', 'published'])
+df_bioRxiv.loc[df_bioRxiv.field.isna(), 'field'] = 'NA'
+
+df_bioRxiv_agg = df_bioRxiv.resample('M', on='date').count()[['field', 'published']].reset_index()
+df_bioRxiv_agg['success'] = df_bioRxiv_agg['published'] / df_bioRxiv_agg['field']
+
+df_bioRxiv_pub = df_bioRxiv[~df_bioRxiv.published.isna()].copy()
+
+# add pub date if avaliable
+def get_pub_date(doi):
+    if not doi:
+        return None
+    cursor_scholar.execute("SELECT year FROM records WHERE doi = '{}';".format(doi))
+    year = cursor_scholar.fetchone()
+    return year[0] if year else None
+
+df_bioRxiv_pub['pub_year'] = df_bioRxiv_pub.published.apply(lambda x : get_pub_date(x))
+df_bioRxiv_pub['pub_lag'] = df_bioRxiv_pub.apply(lambda x : (datetime.datetime(year=int(x.pub_year), month=12, day=31) - x.date) if not math.isnan(x.pub_year) else None, axis=1)
+df_bioRxiv_pub = df_bioRxiv_pub[~df_bioRxiv_pub.pub_year.isna()].copy()
+
+
+df_bioRxiv_fields = df_bioRxiv.groupby('field').resample('M', on='date').count().rename(columns={'date':'value'})[['value']].reset_index().pivot(index='date', columns='field', values='value')
+
+
+
+
+
+
+
+
+# bioRxiv paper vs peers in same journal + year
+def get_year_journal(doi):
+    cursor_scholar.execute("SELECT year, journal FROM records WHERE doi ='{}';".format(doi))
+    return cursor_scholar.fetchone()
+
+it = (get_year_journal(doi) for doi in tqdm.tqdm(df_bioRxiv_pub.published))
+target_journals = set([x for x in it if x])
+
+def get_doi_cited(**kwargs):
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    cursor_scholar.execute("""SELECT records.doi, record_citations.cited FROM records LEFT JOIN record_citations ON records.ROWID = record_citations.ROWID WHERE {};""".format(
+        ' AND '.join(['records.{key}="{value}"'.format(key=key, value=escape_str(str(value))) for key, value in kwargs.items()])
+    ))
+    return [x for x in cursor_scholar]
+
+df_bioRxiv_pub['cited'] = df_bioRxiv_pub.published.apply(lambda x : get_doi_cited(doi=x)[0][1])
+
+bioRxiv_dois = set(df_bioRxiv_pub.published)
+df_bioRxiv_peers = pd.DataFrame([(doi, year, cited) for year, journal in tqdm.tqdm(target_journals, ncols=100, desc='peer journals') for doi, cited in get_doi_cited(year=year, journal=journal) if not doi in bioRxiv_dois], columns=['doi', 'year', 'cited'])
+
+df_bioRxiv_peers.shape
+# (2894865, 3)
+
+
+df_bioRxiv_peers = pd.concat([df_bioRxiv_peers[['year', 'cited']].assign(bioRxiv=False), df_bioRxiv_pub[['pub_year', 'cited']].rename(columns={'pub_year':'year', 'cited':'cited'}).assign(bioRxiv=True) ])
+
+df_bioRxiv_peers_n = df_bioRxiv_peers.groupby(['year', 'bioRxiv']).agg(n=('cited', 'count'))
+# n
+# year   bioRxiv
+# 2007.0 False      1200
+#        True          1
+# 2013.0 False      2521
+#        True          4
+# 2014.0 False     45112
+#        True         58
+# 2015.0 False    126514
+#        True        638
+# 2016.0 False    201896
+#        True       1701
+# 2017.0 False    380462
+#        True       4308
+# 2018.0 False    541531
+#        True       8913
+# 2019.0 False    807226
+#        True      13565
+# 2020.0 False    364021
+#        True       8449
+# 2021.0 False         7
+#        True          1
+
+
+
+
+# bioRxiv target journals vs all journals with field Biology
+def get_year_journal(doi):
+    cursor_scholar.execute("SELECT year, journal FROM records WHERE doi ='{}';".format(doi))
+    return cursor_scholar.fetchone()
+
+it = (get_year_journal(doi) for doi in df_bioRxiv_pub.published)
+bioRxiv_journals = set([(year, journal) for year, journal in it if year and journal])
+
+def get_peer_journals(doi):
+    cursor_scholar.execute("SELECT ROWID from records WHERE doi = '{}'".format(doi))
+    rowid = next(cursor_scholar)[0]
+    cursor_scholar.execute("SELECT records.year, records.journal FROM records JOIN citations ON records.ROWID = citations.cited WHERE citations.citing = {} AND records.journal IS NOT NULL and records.year IS NOT NULL;".format(rowid))
+    cited = [x for x in cursor_scholar]
+    cursor_scholar.execute("SELECT records.year, records.journal FROM records JOIN citations ON records.ROWID = citations.citing WHERE citations.cited = {} AND records.journal IS NOT NULL and records.year IS NOT NULL;".format(rowid))
+    citing = [x for x in cursor_scholar]
+    return cited + citing
+
+peer_journals = set([(year, journal) for doi in df_bioRxiv_pub.published for year, journal in get_peer_journals(doi)])
+
+def get_journal_citations(year, journal):
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    cursor_scholar.execute("""SELECT cited_mean FROM journals WHERE journal = "{}" AND year = {};""".format(escape_str(journal), year))
+    return next(cursor_scholar)[0]
+
+
+df_bioRxiv_journal = pd.concat([pd.DataFrame([(year, journal, get_journal_citations(year, journal)) for year, journal in bioRxiv_journals], columns=['year', 'journal', 'cited_mean']).assign(bioRxiv=True), pd.DataFrame([(year, journal, get_journal_citations(year, journal)) for year, journal in peer_journals], columns=['year', 'journal', 'cited_mean']).assign(bioRxiv=False)])
+
+
+
+
+# paper over time
+f, ax = plt.subplots(ncols=1, figsize=(4,4))
+_ax = sns.lineplot(x='date', y='field', data=df_bioRxiv_agg, ax=ax)
+_ax.fill_between(df_bioRxiv_agg.date, df_bioRxiv_agg.field)
+_ax = sns.lineplot(x='date', y='published', color='red', data=df_bioRxiv_agg, ax=ax)
+_ax.fill_between(df_bioRxiv_agg.date, df_bioRxiv_agg.published, color='red')
+_ax.set_ylabel("new paper per month")
+_ax.xaxis.set_major_locator(years)
+_ax.xaxis.set_major_formatter(years_fmt)
+_ax.xaxis.set_minor_locator(months)
+_ax.format_xdata = mdates.DateFormatter('%Y-%m-%d')
+
+f.autofmt_xdate()
+f.savefig('plots/bioRxiv_posts.pdf')
+plt.close('all')
+
+
+# success rate
+f, ax = plt.subplots(ncols=1, figsize=(4,4))
+_ax = sns.lineplot(x='date', y='success', data=df_bioRxiv_agg, ax=ax)
+_ax.set_ylabel("publication rate")
+_ax.xaxis.set_major_locator(years)
+_ax.xaxis.set_major_formatter(years_fmt)
+_ax.xaxis.set_minor_locator(months)
+_ax.format_xdata = mdates.DateFormatter('%Y-%m-%d')
+f.autofmt_xdate()
+f.savefig('plots/bioRxiv_success.pdf')
+plt.close('all')
+
+
+# categories
+f, ax = plt.subplots(ncols=1, figsize=(10,10))
+_ax = sns.countplot(y="field", order=df_bioRxiv.groupby('field').count().reset_index().sort_values(by='date').field, data=df_bioRxiv, ax=ax)
+plt.tight_layout()
+f.savefig('plots/bioRxiv_fields.pdf')
+plt.close('all')
+
+
+# categories over time
+ax = df_bioRxiv_fields.reindex(df_bioRxiv_fields.sum().sort_values().index, axis=1).apply(lambda x: x/x.sum(), axis=1).plot.area(figsize=(16,10))
+#ax = df_bioRxiv_fields.reindex(df_bioRxiv_fields.sum().sort_values().index, axis=1).plot.area(figsize=(16,10))
+ax.set_xlim(datetime.datetime(year=2015, month=1, day=1), datetime.datetime(year=2020, month=7, day=1))
+plt.savefig('plots/bioRxiv_fields_time.pdf')
+
+
+# publication lag
+f, ax = plt.subplots(ncols=1, figsize=(4,4))
+_ax = sns.kdeplot(df_bioRxiv_pub.dropna().pub_lag.apply(lambda x : (datetime.datetime(year=2000, month=1, day=1) + x).toordinal()), shade=True, cumulative=True, legend=False, ax=ax)
+x_ticks = _ax.get_xticks()
+_ax.set_xticks(x_ticks[::2])
+xlabels = [datetime.datetime.fromordinal(int(x)).strftime('%Y-%m-%d') for x in x_ticks[::2]]
+_ax.set_xticklabels(xlabels)
+_ax.xaxis.set_major_locator(years)
+_ax.xaxis.set_major_formatter(years_fmt)
+_ax.xaxis.set_minor_locator(months)
+_ax.format_xdata = mdates.DateFormatter('%Y-%m-%d')
+_ax.set_xlim(datetime.datetime(year=2000, month=1, day=1), datetime.datetime(year=2003, month=1, day=1))
+_ax.set_xlabel("publication lag")
+f.savefig('plots/bioRxiv_lag.pdf')
+plt.close('all')
+
+
+# impact vs peers
+f, ax = plt.subplots(1, figsize=(10, 10))
+ax = sns.boxplot(x="year", y="cited", hue="bioRxiv",
+                    data=df_bioRxiv_peers[(df_bioRxiv_peers.cited < df_bioRxiv_peers.cited.quantile(0.99)) & (df_bioRxiv_peers.year > 2013) & (df_bioRxiv_peers.year < 2021)], fliersize=0, palette="muted", ax=ax)
+ax.set_ylim(0,60)
+f.savefig('plots/bioRxiv_peer_paper.pdf')
+plt.close('all')
+
+
+# journals vs peers
+f, ax = plt.subplots(1, figsize=(10, 10))
+ax = sns.boxplot(x="year", y="cited_mean", hue="bioRxiv",
+                    data=df_bioRxiv_journal[(df_bioRxiv_journal.year > 2013) & (df_bioRxiv_journal.year < 2021) & (df_bioRxiv_journal.cited_mean < df_bioRxiv_journal.cited_mean.quantile(0.99))], fliersize=0, palette="muted", ax=ax)
+ax.set_ylim(0,60)
+f.savefig('plots/bioRxiv_peer_journals.pdf')
+plt.close('all')
+
+
+```
+
+
+
+
+
+
+
+
+# min hash title+abstract
+python3
+```
+import os, sys, glob
+import gzip, re, json
+import sqlite3
+import tqdm
+import datetime
+import h5py
+import umap
+import umap.plot
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from collections import Counter
+from datasketch import MinHash
+
+
+#db_file = '../../01_database/BioRxiv.db'
+db_file = '/scratch/local2/giesselm/scholar/bioRxiv.db'
+
+# bioRxiv databases
+conn = sqlite3.connect(db_file)
+cursor = conn.cursor()
+
+n_hashes = 256
+dt = np.dtype([('rowid', 'u8')] + [('h{}'.format(i), 'u8') for i in range(n_hashes)])
+
+
+def hash_record(rowid, title='', abstract=''):
+    m = MinHash(num_perm=n_hashes, seed=42)
+    token = ' '.join([title, abstract]).lower().split()
+    _ = [m.update(t.encode('utf-8')) for t in token]
+    return (rowid, ) + tuple(m.hashvalues)
+
+cursor.execute("SELECT COUNT(*) c FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+total = cursor.fetchone()[0]
+
+
+cursor.execute("SELECT ROWID, title, abstract FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+h = np.array([hash_record(rowid, title, abstract) for rowid, title, abstract in tqdm.tqdm(cursor, desc='Hashing', ncols=100, total=total)], dtype=dt)
+
+
+# write hashes
+with h5py.File("hashes.hdf5", 'w') as fp:
+    fp.create_dataset("hashes", data=h)
+
+
+# load hashes
+with h5py.File("hashes.hdf5", 'r') as fp:
+    h = fp['hashes'][...]
+
+
+# UMAP on MinHash
+data_idx = h['rowid'][:5000]
+data_emb = h.view(np.uint64).reshape(h.shape + (-1,))[:5000,1:]
+
+# PCA to 50 dims
+pca = PCA(n_components=50, random_state=42)
+data_pca = np.ascontiguousarray(pca.fit_transform(data_emb))
+
+
+def fetch_field(cursor, rowid, col='field'):
+    cursor.execute("SELECT {} FROM records WHERE ROWID = {};".format(col, rowid))
+    field = cursor.fetchone()
+    if field and field[0]:
+        return field[0]
+    else:
+        return 'NA'
+
+labels = [fetch_field(cursor, id, 'field') for id in tqdm.tqdm(data_idx, ncols=150, desc='Labels')]
+labels = np.array(labels)
+
+# UMAP
+# requires peak 500 G RAM
+mapper = umap.UMAP(n_neighbors=32, min_dist=0.1, metric='euclidean', verbose=True).fit(data_pca)
+
+#with open('S2ORC.umap', 'wb') as fp:
+#    pickle.dump(mapper, fp)
+
+ax = umap.plot.points(mapper, labels=labels, background='black', theme='fire')
+plt.show()
+
+```
+
+
+
+
+
+
+
+
+# UMAP title and abstract
+python3
+```
+import glob, gzip, json, re
+import sqlite3
+import h5py
+import itertools
+import tqdm
+import umap
+import umap.plot
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import Counter, defaultdict
+from datasketch import MinHash
+from wordcloud import WordCloud
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN, OPTICS, cluster_optics_dbscan
+from nltk.tokenize import RegexpTokenizer
+from nltk.corpus import stopwords
+from nltk.stem.snowball import SnowballStemmer
+from nltk.stem.porter import PorterStemmer
+
+
+# import nltk
+# nltk.download('stopwords', download_dir='/project/miniondev/virtual/scholar/nltk_data')
+
+
+# database connection
+db_file = '../../01_database/bioRxiv.db'
+#db_file = '/scratch/local2/giesselm/scholar/bioRxiv.db'
+
+# bioRxiv databases
+conn = sqlite3.connect(db_file)
+cursor = conn.cursor()
+
+
+# extract vocabulary
+cursor.execute("SELECT COUNT(*) c FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+total = cursor.fetchone()[0]
+
+cursor.execute("SELECT title, abstract FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+vocabulary = Counter([word for title, abstract in tqdm.tqdm(cursor, desc="Vocabulary", ncols=100, total=total)
+    for word in set(re.split('\W+', ' '.join([title, abstract]).lower()))])
+
+sub_vocabulary = [word for word in vocabulary.most_common() if word[1] > 20 and word[1] < (total * 0.33)]
+sub_vocabulary.sort(key=lambda x : x[1])
+
+sub_words = set(w[0] for w in sub_vocabulary)
+
+
+# tokenize
+np.random.seed(42)
+stemmer = PorterStemmer()
+tokenizer = RegexpTokenizer(r'[a-zA-Z\']+')
+
+def tokenize(text):
+    return [stemmer.stem(word) for word in tokenizer.tokenize(text.lower())]
+
+en_stop = stopwords.words('english')
+punc = ['.', ',', '"', "'", '?', '!', ':', ';', '(', ')', '[', ']', '{', '}',"%"]
+en_stop_token = set([tokenize(word)[0] for word in en_stop])
+en_stop_token = en_stop_token.union(punc)
+
+
+vectorizer = TfidfVectorizer(stop_words = en_stop_token, tokenizer = tokenize, min_df=10, max_df=0.5, max_features = 10000)
+cursor.execute("SELECT ROWID, title, abstract FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+data_idx, data_txt = zip(*[(rowid, (title, abstract)) for rowid, title, abstract in cursor])
+vectorizer_values = vectorizer.fit_transform([' '.join([title, abstract]) for title, abstract in data_txt])
+
+svd = TruncatedSVD(n_components=50, random_state=42)
+vectorizer_pca = np.ascontiguousarray(svd.fit_transform(vectorizer_values))
+
+print("Explained variance:", svd.explained_variance_ratio_.sum())
+# Explained variance: 0.109
+
+# save vectorizer
+with h5py.File('vectorizer.hdf5', 'w') as fp:
+    fp.create_dataset('vectorizer', data=vectorizer_pca)
+
+
+# load vectorizer
+with h5py.File('vectorizer.hdf5', 'r') as fp:
+    vectorizer_pca = fp['vectorizer'][...]
+
+
+def fetch_field(cursor, rowid, col='field'):
+    cursor.execute("SELECT {} FROM records WHERE ROWID = {};".format(col, rowid))
+    field = cursor.fetchone()
+    if field and field[0]:
+        return field[0]
+    else:
+        return 'NA'
+
+labels = np.array([fetch_field(cursor, id, 'field') for id in tqdm.tqdm(data_idx, ncols=100, desc='Labels')])
+s = set(['bioinformatics', 'biochemistry', 'cancer biology', 'cell biology', 'genetics', 'genomics', 'molecular biology'])
+labels2 = np.array([l if l in s else 'other' for l in labels])
+
+n = 40000
+n = vectorizer_pca.shape[0]
+mapper = umap.UMAP(n_neighbors=32, min_dist=0.01, metric='manhattan', force_approximation_algorithm=True, random_state=42, verbose=True).fit(vectorizer_pca[:n,:])
+
+#with open('S2ORC.umap', 'wb') as fp:
+#    pickle.dump(mapper, fp)
+
+ax = umap.plot.points(mapper, labels=labels[:n], background='black', theme='fire')
+plt.show()
+
+```

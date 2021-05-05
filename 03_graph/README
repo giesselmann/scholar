@@ -1,0 +1,347 @@
+# subsample database by core citation network
+## find connected nodes
+source /project/miniondev/virtual/scholar/bin/activate
+
+python3
+```
+import os, sys, random
+import sqlite3
+import tqdm
+import itertools
+import numpy as np
+import pandas as pd
+import networkx as nx
+import seaborn as sns
+import matplotlib.pyplot as plt
+from datetime import datetime
+from collections import Counter
+
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+sns.set(style="ticks", rc={"axes.facecolor": (0, 0, 0, 0)})
+
+# record data base
+#db_file = '../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+
+# largest connected component
+## low memory footprint but slow
+## possible to get stuck in local minimum
+def cc_iter(cursor, batch=100000):
+    edge_batch = [c for c, _ in zip(cursor, range(batch))]
+    while len(edge_batch):
+        G = nx.Graph()
+        G.add_edges_from(edge_batch)
+        yield [set(x) for x in nx.connected_components(G)]
+        edge_batch = [c for c, _ in zip(cursor, range(batch))]
+
+
+def merge_connected_components(cc, max_iter=10):
+    def merge_iter(c):
+        c.sort(key=lambda x: len(x))
+        c_largest = c.pop()
+        while len(c):
+            c0 = c.pop()
+            if len(c0.intersection(c_largest)):
+                c_largest.update(c0)
+            else:
+                yield c0
+        yield c_largest
+    for _ in range(max_iter):
+        cc = [c for c in merge_iter(cc)]
+    return cc
+
+
+cursor.execute("SELECT citing, cited FROM citations ORDER BY citing;")
+it = 0
+cc = []
+batch_size = 500000
+cci = cc_iter(cursor, batch=batch_size)
+
+
+# runs for 4h on SSD
+while True:
+    try:
+        cc.extend([c for c in next(cci)])
+        cc = merge_connected_components(cc, max_iter=10)
+        it += batch_size
+        print(datetime.now(), ": Processed {} edges, currently {} ccs, largest {}".format(it, len(cc), len(cc[-1])))
+    except StopIteration:
+        break
+
+
+# manually re-merge until (near-)convergence
+len(cc)
+# 219012
+sum([len(c) for c in cc])
+# 68427091
+[len(c) for c in cc][-5:]
+# [2, 2, 2, 2, 67945532]
+[len(c) for c in cc][-1] / sum([len(c) for c in cc])
+# 0.993
+
+
+
+# connected sub-graphs of min citation counts
+def extract_connected(min_year=2010, min_citations=[20]):
+    cursor.execute("SELECT r1.rowid, r2.rowid, rc1.cited, rc2.cited FROM records r1 JOIN record_citations rc1 ON r1.rowid = rc1.rowid JOIN citations c ON r1.rowid = c.citing JOIN record_citations rc2 ON c.cited = rc2.rowid JOIN records r2 ON rc2.rowid = r2.rowid WHERE rc1.cited >= {min_citations} AND rc2.cited >= {min_citations} AND r1.year >= {min_year} AND r2.year >= {min_year} AND r1.title IS NOT NULL AND r2.title IS NOT NULL;".format(min_citations=min(min_citations), min_year=min_year))
+    edges = [(citing, cited, c1, c2) for citing, cited, c1, c2 in tqdm.tqdm(cursor, ncols=20, desc='reading connected graph')]
+    # count nodes to filter for isolated edges
+    for min_cite in min_citations:
+        c = Counter([node for edge in edges for node in edge[:2] if edge[2] >= min_cite and edge[3] >= min_cite])
+        nodes = set([key for key, value in c.items() if value > 1])
+        # write edges of connected nodes
+        with open('records_{year}_{citations}_citations.edges.tsv'.format(year=min_year, citations=min_cite), 'w') as fp:
+            fp.write('\n'.join(['\t'.join([str(citing), str(cited)]) for citing, cited, _, _ in edges if citing in nodes and cited in nodes and citing != cited]))
+            fp.write('\n')
+
+
+# runs for 1h on SSD
+extract_connected(min_year=1980, min_citations=[20])
+
+# runs for 2h on SSD, 70G RAM
+extract_connected(min_year=1980, min_citations=[20, 15, 10, 5])
+
+
+# read edges from tsv
+df_edges = pd.read_csv('records_1980_20_citations.edges.tsv', sep='\t', names=['citing', 'cited'])
+df_edges.shape
+# (166630379, 2)
+
+# create networkx graph
+## requires 70G RAM
+G = nx.Graph()
+G.add_edges_from(df_edges.itertuples(index=False))
+
+# connected components
+G_comp = [len(c) for c in sorted(nx.connected_components(G), key=len, reverse=True)]
+G.number_of_nodes()
+# 9424639
+G_comp[:5]
+# [9424378, 7, 7, 6, 6]
+len(G_comp)
+# 82
+
+
+# field interaction heatmap
+def get_field(rowid):
+    cursor.execute("SELECT fields FROM records WHERE rowid = {};".format(rowid))
+    return (next(cursor)[0] or '').split('|')[0]
+
+
+field = {rowid:get_field(rowid) for rowid in tqdm.tqdm(df_edges.unstack().unique())}
+
+c = Counter(((field[citing], field[cited]) for citing, cited in df_edges.itertuples(index=False)))
+
+fields = [(src, trgt, count) for (src, trgt), count in c.most_common() if src and trgt]
+df_citing = pd.DataFrame(fields, columns=['citing', 'cited', 'citations'])
+df_citing_wide = pd.pivot_table(df_citing, index='citing', columns='cited', fill_value=1)
+df_citing_log = np.log10(df_citing_wide)
+
+
+g = sns.clustermap(df_citing_log, col_cluster=False, row_cluster=True, method='centroid', metric='cosine')
+row_order = g.dendrogram_row.reordered_ind
+g = sns.clustermap(df_citing_log[df_citing_log.columns[row_order]], col_cluster=False, row_cluster=True, method='centroid', metric='cosine', cmap=sns.color_palette("viridis", as_cmap=True))
+g.savefig('plots/records_1980_20_citations_interactions.pdf', dpi=300)
+plt.close('all')
+```
+
+
+
+
+## node2vec embedding using GraphVite
+source /project/miniondev/conda/profile3.7
+conda activate graphvite
+
+
+# crate default config
+graphvite new graph --file graphvite.yaml
+
+
+python3
+```
+import os, yaml
+from easydict import EasyDict
+import numpy as np
+import pandas as pd
+import graphvite as gv
+import graphvite.application as gap
+
+
+with open('graphvite.yaml', "r") as fin:
+    cfg = EasyDict(yaml.safe_load(fin))
+
+
+del cfg['evaluate']; del cfg['load']; del cfg['save']
+
+
+if "optimizer" in cfg.build:
+    cfg.build.optimizer.type = 'RMSprop'
+    cfg.build.optimizer.lr = 1e-4
+    cfg.build.optimizer.weight_decay = 0
+    cfg.build.optimizer.schedule = 'linear'
+    cfg.build.optimizer = gv.optimizer.Optimizer(**cfg.build.optimizer)
+
+
+# common changes
+# number of partitions
+cfg.train.model = 'DeepWalk'
+cfg.resource.gpus = []
+cfg.build.num_partition = 4
+# batch size of samples in CPU-GPU transfer
+cfg.build.batch_size = 100000
+# number of batches in a partition block
+cfg.build.episode_size = 'auto'
+cfg.train.num_epoch = 2000
+cfg.train.shuffle_base = 'auto'
+cfg.train.positive_reuse = 1
+cfg.build.num_negative = 1
+cfg.train.negative_weight = 5.0
+cfg.train.negative_sample_exponent = 0.75
+#  node pairs with distance <= augmentation_step are considered as positive samples
+cfg.train.augmentation_step = 1
+cfg.train.random_walk_length = 80
+cfg.train.log_frequency = 1000
+# auto settings
+cfg = gv.util.recursive_map(cfg, lambda x: gv.auto if x == "auto" else x)
+# update file names
+cfg.graph.file_name = 'records_1980_20_citations.edges.tsv'
+# cfg.graph.normalization = True
+
+
+# build & configure
+app = gap.Application(cfg.application, **cfg.resource)
+app.set_format(**cfg.format)
+app.load(**cfg.graph)
+# #vertex: 8.732.352, #edge: 146.066.814
+# #vertex: 9.424.639, #edge: 166.630.379
+app.build(**cfg.build)
+
+app.train(**cfg.train)
+
+# save embeddings
+names = np.array(app.graph.id2name).astype(np.int64)
+embeddings = app.solver.vertex_embeddings
+df_emb = pd.DataFrame(embeddings, index=names)
+df_emb.to_hdf('records_1980_20_citations.emb.hdf5', 'embeddings', 'w')
+del app
+
+```
+
+
+
+
+## visualize embedding using UMAP
+source /project/miniondev/virtual/scholar/bin/activate
+export NUMBA_NUM_THREADS=64
+
+python3
+```
+import glob, gzip, json, re
+import sqlite3
+import pickle
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import scipy
+import umap
+import umap.plot
+import matplotlib.pyplot as plt
+import matplotlib.colors
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.preprocessing import quantile_transform
+from sklearn.cluster import KMeans, OPTICS, DBSCAN
+from tqdm import tqdm
+
+
+# configure matplotlib
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+
+
+# load embeddings
+df_emb = pd.read_hdf('records_1980_20_citations.emb.hdf5')
+names = df_emb.index.values
+df_emb.shape
+# (9424639, 128)
+
+# PCA to 64 dims
+pca = PCA(n_components=64, random_state=42)
+df_emb_pca = pd.DataFrame(pca.fit_transform(df_emb), index=names)
+sum(pca.explained_variance_ratio_)
+# 0.848
+
+# UMAP
+# requires peak 15 G RAM
+n_subset = len(names) // 200
+
+np.random.seed(42)
+names_subset = np.random.choice(names, n_subset, replace=False)
+mapper = umap.UMAP(n_neighbors=75, min_dist=0.01, metric='correlation', random_state=42, verbose=True).fit(df_emb_pca.loc[names_subset])
+
+df_umap = pd.DataFrame(mapper.embedding_, columns=['UMAP_1', 'UMAP_2'], index=names_subset)
+
+
+# Save/Load
+with open('records_1980_20_citations.umap.pkl', 'wb') as fp:
+    pickle.dump(mapper, fp)
+
+#with open('records_1980_20_citations.umap.pkl', 'rb') as fp:
+#    mapper = pickle.load(fp)
+
+
+
+
+# get field label from database
+#db_file = '../01_database/scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+
+connection = sqlite3.connect(db_file)
+record_cursor = connection.cursor()
+
+def fetch_field(cursor, rowid, col='field'):
+    cursor.execute("SELECT {} FROM records r LEFT JOIN record_citations rc ON r.rowid = rc.rowid WHERE r.rowid = {};".format(col, rowid))
+    field = cursor.fetchone()
+    if field and field[0]:
+        return field[0]
+    else:
+        return 'NA'
+
+
+hue_order = ['Chemistry', 'Biology', 'Computer Science', 'Engineering', 'Mathematics', 'Physics', 'Medicine']
+
+df_umap['field'] = [fetch_field(record_cursor, id, 'fields').split('|')[0] for id in tqdm(names_subset, ncols=150)]
+df_umap['year'] = [fetch_field(record_cursor, id, 'year') for id in tqdm(names_subset, ncols=150)]
+df_umap['cited'] = [fetch_field(record_cursor, id, 'cited') for id in tqdm(names_subset, ncols=150)]
+df_umap['cited_q'] = quantile_transform(df_umap.cited.values.reshape(-1,1), n_quantiles=100, copy=True)
+df_umap['mask'] = np.isin(df_umap.field, hue_order)
+
+
+df_umap.shape
+# (47123, 4)
+df_umap['mask'].sum()
+# 30140
+
+
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = sns.scatterplot(x='UMAP_1', y='UMAP_2', hue='field', hue_order=hue_order, size='cited_q', marker='.', linewidth=0, alpha=0.8, sizes=(1,50), palette=sns.color_palette("Paired", 7), data=df_umap[df_umap['mask']])
+plt.savefig('plots/records_1980_20_citations.umap.pdf')
+_ax.get_legend().remove()
+plt.savefig('plots/records_1980_20_citations.umap.png', dpi=300)
+plt.close('all')
+
+
+f, ax = plt.subplots(1, figsize=(16,9))
+_ax = sns.scatterplot(x='UMAP_1', y='UMAP_2', hue='year', size='cited_q', marker='.', linewidth=0, alpha=0.5, sizes=(5,75), palette=sns.color_palette("viridis", as_cmap=True), data=df_umap[df_umap['mask']])
+plt.savefig('plots/records_1980_20_citations.umap_year.pdf')
+_ax.get_legend().remove()
+plt.savefig('plots/records_1980_20_citations.umap_year.png', dpi=300)
+plt.close('all')
+
+```

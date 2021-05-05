@@ -1,0 +1,140 @@
+# download S2ORC data
+# access request on https://github.com/allenai/s2orc#valid-release-versions
+# modify dl_s2orc_20200705v1_full_urls_expires_20201006.sh, exit after metadata
+mkdir S2ORC && cd S2ORC
+chmod +x dl_s2orc_20200705v1_full_urls_expires_20201006.sh
+./dl_s2orc_20200705v1_full_urls_expires_20201006.sh
+
+
+
+
+# crawl bioRxiv
+mkdir -p bioRxiv
+
+python3
+```
+import gzip
+import json
+import requests
+import tqdm
+
+initial_query = json.loads(requests.get('https://api.biorxiv.org/details/biorxiv/2000-01-01/2030-12-31').text)
+cursor = 0
+total = initial_query['messages'][0]['total']
+
+with gzip.open('bioRxiv/bioRxiv.jsonl.gz', 'w') as fp, tqdm.tqdm(total=total, desc='download', ncols=150) as pbar:
+    while cursor < total:
+        response = requests.get('https://api.biorxiv.org/details/biorxiv/2000-01-01/2030-12-31/{}'.format(cursor))
+        response_data = json.loads(response.text)
+        for c in response_data['collection']:
+            _ = fp.write(json.dumps(c).encode() + b'\n')
+        count = response_data['messages'][0]['count']
+        cursor += count
+        pbar.update(count)
+
+
+```
+
+
+
+# download COCI data
+# https://figshare.com/articles/Crossref_Open_Citation_Index_CSV_dataset_of_all_the_citation_data/6741422/7
+# https://figshare.com/articles/dataset/Crossref_Open_Citation_Index_CSV_dataset_of_all_the_citation_data/6741422/9
+mkdir -p COCI
+wget https://ndownloader.figshare.com/articles/6741422/versions/9 -O COCI/6741422.zip
+unzip COCI/6741422.zip -d COCI/
+rm COCI/6741422.zip
+## rewrite into tsv
+## cols: citing, cited
+find COCI/ -name '*.zip' -exec unzip -p {} \; | grep -Ev '^oci.*$' | tr ',' '\t' | cut -f2,3 | gzip > COCI/6741422.tsv.gz
+rm COCI/*.zip
+
+
+
+
+# download Crossref
+mkdir -p Crossref
+python3
+```
+import os, gzip, json
+import tqdm
+from crossref.restful import Works, Etiquette
+
+
+# polite with affiliation
+my_etiquette = Etiquette('YourProject', 'v1.0', 'https://www.yourdomain.com', 'you@yourdomain.com')
+works = Works(etiquette=my_etiquette)
+
+# anonymous pool
+works = Works()
+
+# get index/deposited data from previous downloads e.g.
+# 2020-08-02T22:12:01Z
+
+# complete update all re-indexed records
+w0 = works.filter(type='journal-article', from_index_date='2020-08-03').select('DOI', 'issued', 'container-title', 'title', 'abstract', 'indexed').sort('indexed').order('asc')
+c0 = w0.count()
+
+# only new deposited records
+w0 = works.filter(type='journal-article', from_deposit_date='2020-11-28').select('DOI', 'issued', 'container-title', 'title', 'abstract', 'indexed', 'deposited').sort('indexed').order('asc')
+c0 = w0.count()
+
+# create output and init counter
+d_output = 'Crossref/20210104/'
+os.makedirs(d_output, exist_ok=True)
+batch_name = 'metadata_{:.0f}.jsonl.gz'
+## modify after aborts, default (0, None)
+offset = 6135180
+last_success_doi = '10.1215/21581665-7258055'
+
+
+def write_records(iterable, offset=0, last_success_doi=None, n=1e6):
+    offset = int(offset)
+    n=int(n)
+    iterable = iter(iterable)
+    while True:
+        current_batch = os.path.join(d_output, batch_name.format(offset // n))
+        with gzip.open(current_batch, 'ab') as fp:
+            try:
+                i = offset % n
+                while i < n:
+                    raw = next(iterable)
+                    if not raw.get('DOI'):
+                        continue
+                    if last_success_doi:
+                        if raw['DOI'] != last_success_doi:
+                            continue
+                        else:
+                            last_success_doi = None
+                            print("Continue writing after abort.")
+                            continue
+                    record = {}
+                    record['doi'] = raw.get("DOI")
+                    try:
+                        record['year'] = int(raw['issued']['date-parts'][0][0])
+                    except:
+                        record['year'] = None
+                    record['journal'] = raw["container-title"][0] if 'container-title' in raw else None
+                    record['title'] = raw['title'][0] if 'title' in raw else None
+                    record['abstract'] = raw['abstract'] if 'abstract' in raw else None
+                    record['indexed'] = raw['indexed']['date-time']
+                    record['deposited'] = raw['deposited']['date-time']
+                    fp.write(json.dumps(record, sort_keys=True).encode())
+                    fp.write(b'\n')
+                    i += 1
+                    offset += 1
+            except StopIteration as e:
+                print(e)
+                return offset, record
+            except Exception as e:
+                print(e)
+                return offset, record
+
+
+
+# 44 it/s, runs for days....
+w0_iter = iter(w0)
+offset, indexed = write_records(tqdm.tqdm(w0_iter, desc='download', total=c0, ncols=100), offset=offset, last_success_doi=last_success_doi)
+
+
+```

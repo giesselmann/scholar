@@ -1,0 +1,644 @@
+# S2
+python3
+```
+import os, sys, glob
+import gzip, re, json
+import sqlite3
+import tqdm
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+
+#db_file = 'scholar.db'
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+cursor.execute("pragma journal_mode = MEMORY;")
+cursor.execute("pragma synchronous = OFF;")
+cursor.execute("""pragma page_size;""")
+cursor.fetchall()
+cursor.execute("""pragma cache_size = 100000;""")
+cursor.execute("""pragma cache_size;""")
+cursor.fetchall()
+
+# page size is updated by VACUUM
+cursor.execute("""VACUUM""")
+connection.commit()
+
+
+
+
+# CREATE tables
+## main records table
+sql_command = """
+CREATE TABLE records (
+rowid INTEGER PRIMARY KEY,
+doi TEXT NOT NULL,
+year INTEGER,
+journal TEXT,
+title TEXT,
+abstract TEXT,
+field TEXT,
+fields TEXT
+);"""
+cursor.execute(sql_command)
+
+## main citations table
+sql_command = """
+CREATE TABLE citations (
+rowid INTEGER PRIMARY KEY,
+citing INTEGER NOT NULL,
+cited INTEGER NOT NULL,
+FOREIGN KEY (citing) REFERENCES records (rowid) ON DELETE CASCADE ON UPDATE NO ACTION,
+FOREIGN KEY (cited) REFERENCES records (rowid) ON DELETE CASCADE ON UPDATE NO ACTION
+);"""
+cursor.execute(sql_command)
+connection.commit()
+
+
+
+
+# list all tables
+cursor.execute('SELECT name from sqlite_master where type= "table"')
+cursor.fetchall()
+
+
+
+
+# INSERT S2ORC data
+s2_batch_files = glob.glob('../00_data/S2ORC/20200705v1/full/metadata/metadata_*.jsonl.gz')
+
+def batch_iter(batch_files):
+    return (batch_file for batch_file in tqdm.tqdm(batch_files, desc='Batch', ncols=100))
+
+def record_iter(batch_file):
+    data = gzip.open(batch_file, 'rb').read()
+    return (json.loads(record.group(0).decode()) for record in re.finditer(rb'\{.*?\}(?=(\n))', data))
+
+def field_filter(record):
+    return record['doi'] and record['title'] and (len(record['title']) > 0) and (len(record['doi']) > 0)
+
+def write_s2_record(cursor, record):
+    rowid = record['paper_id']
+    doi = record['doi']
+    year = record['year']
+    journal = record['journal']
+    title = record['title']
+    abstract = record['abstract']
+    fields = record['mag_field_of_study']
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    try:
+        # IGNORE will drop empty dois
+        cursor.execute("""INSERT OR IGNORE INTO records (rowid, doi, year, journal, title, abstract, fields)
+        VALUES ({rowid}, {doi}, {year}, {journal}, {title}, {abstract}, {fields})""".format(
+            rowid=rowid,
+            doi='"{}"'.format(escape_str(doi)),
+            year=year if year else "NULL",
+            journal='"{}"'.format(escape_str(journal)) if journal else "NULL",
+            title='"{}"'.format(escape_str(title)) if title else "NULL",
+            abstract='"{}"'.format(escape_str(abstract)) if abstract else "NULL",
+            fields = '"{}"'.format('|'.join(fields)) if fields else "NULL"
+        ))
+        if len(record['outbound_citations']):
+            outbound_citations_unique = np.unique(record['outbound_citations'])
+            cursor.execute("""INSERT OR IGNORE INTO citations (citing, cited) VALUES
+            {};""".format(
+                ','.join(['("{}", "{}")'.format(rowid, c) for c in outbound_citations_unique])
+            ))
+        # should be redundant but better safe
+        if len(record['inbound_citations']):
+            cursor.execute("""INSERT OR IGNORE INTO citations (citing, cited) VALUES
+            {};""".format(
+                ','.join(['("{}", "{}")'.format(c, rowid) for c in record['inbound_citations']])
+            ))
+    except sqlite3.OperationalError as e:
+        return 1
+    return 0
+
+
+
+
+# This runs for ~3h on SSD
+# ~8k records/s or 100s/batch
+it = (record for batch_file in batch_iter(s2_batch_files) for record in record_iter(batch_file) if field_filter(record))
+status = [write_s2_record(cursor, record) for record in tqdm.tqdm(it, desc='Parsing')]
+
+print("Total records with DOI: {} Failed to write: {}".format(len(status), sum(status)))
+# Total records with DOI: 78.009.109 Failed to write: 0
+
+connection.commit()
+
+
+
+
+# de-duplicate citations
+# runs ~1h
+cursor.execute("""CREATE TABLE citations_tmp AS SELECT DISTINCT citing, cited FROM citations;""")
+cursor.execute("""DROP TABLE citations;""")
+cursor.execute("""CREATE TABLE citations (
+rowid INTEGER PRIMARY KEY,
+citing INTEGER NOT NULL,
+cited INTEGER NOT NULL,
+FOREIGN KEY (citing) REFERENCES records (rowid) ON DELETE CASCADE ON UPDATE NO ACTION,
+FOREIGN KEY (cited) REFERENCES records (rowid) ON DELETE CASCADE ON UPDATE NO ACTION
+);""")
+cursor.execute("""INSERT INTO citations SELECT ROWID, citing, cited FROM citations_tmp;""")
+cursor.execute("""DROP TABLE citations_tmp;""")
+connection.commit()
+
+
+
+
+# CREATE indices
+cursor.execute("""CREATE INDEX records_doi ON records(doi);""")
+connection.commit()
+
+cursor.execute("""CREATE UNIQUE INDEX citations_citing ON citations(citing, cited);""")
+connection.commit()
+
+cursor.execute("""CREATE INDEX citations_cited ON citations(cited);""")
+connection.commit()
+
+## CREATE fts5 index
+cursor.execute("""CREATE VIRTUAL TABLE records_fts5 USING fts5(title, content=records, content_rowid=rowid, tokenize='porter ascii');""")
+connection.commit()
+
+cursor.execute("""CREATE VIRTUAL TABLE records_abstract_fts5 USING fts5(abstract, content=records, content_rowid=rowid, tokenize='porter ascii');""")
+connection.commit()
+
+
+
+
+# remove duplicate doi rows
+# after indexing as this will drop rows from citations
+cursor.execute("DELETE FROM records WHERE rowid NOT IN (SELECT min(rowid) FROM records GROUP BY doi);")
+connection.commit()
+
+# make doi index unique
+cursor.execute("DROP INDEX records_doi;")
+cursor.execute("CREATE UNIQUE INDEX records_doi ON records(doi);")
+connection.commit()
+
+
+# remove citation edges where one id is missing in records
+cursor.execute("DELETE FROM citations WHERE citing NOT IN (SELECT rowid FROM records) OR cited NOT IN (SELECT rowid FROM records);")
+connection.commit()
+
+
+# delete artifacts of citing identical to cited
+# n = 305.298
+cursor.execute("DELETE FROM citations WHERE citing = cited;")
+connection.commit()
+
+
+
+
+# table sizes
+cursor.execute("SELECT COUNT(doi) FROM records;")
+cursor.fetchone()
+# 77.371.263
+cursor.execute("SELECT COUNT(*) FROM citations")
+cursor.fetchone()
+# 332.997.300
+
+
+# list all tables
+cursor.execute('SELECT name from sqlite_master where type= "table"')
+cursor.fetchall()
+cursor.execute('SELECT name from sqlite_master where type= "index"')
+cursor.fetchall()
+
+
+
+
+# test title
+sql_command = """SELECT ROWID, title FROM records_fts5 WHERE records_fts5 MATCH 'Linking DNA methylation and histon modification":" patterns and paradigms';"""
+cursor.execute(sql_command)
+cursor.fetchone()
+
+sql_command = """SELECT * FROM records WHERE rowid=5450674;"""
+cursor.execute(sql_command)
+cursor.fetchone()
+
+sql_command = """SELECT * FROM citations WHERE citing=5450674;"""
+cursor.execute(sql_command)
+cursor.fetchall()
+
+sql_command = """SELECT * FROM citations WHERE cited=5450674;"""
+cursor.execute(sql_command)
+cursor.fetchall()
+
+
+# test doi
+# 10.1016/j.pharmthera.2014.08.004
+# Feed-forward transcriptional programming by nuclear receptors: Regulatory principles and therapeutic implications
+# Found on ScienceDirect/ Elsevier
+
+sql_command = """SELECT * FROM records WHERE doi = '10.1016/j.pharmthera.2014.08.004';"""
+cursor.execute(sql_command)
+cursor.fetchone()
+
+
+
+
+# INSERT Crossref data
+cursor.execute("""SELECT doi FROM records;""")
+existing_dois = set((x[0] for x in cursor))
+
+
+# incremental updates
+# crossref_batch_files = glob.glob('../00_data/Crossref/20200725/metadata_*.jsonl.gz')
+crossref_batch_files = glob.glob('../00_data/Crossref/20210104/metadata_*.jsonl.gz')
+
+
+# TODO this would ideally be an UPSERT to update title,abstract etc but keep field
+def write_crossref_record(cursor, record, existing_dois=set()):
+    doi = record['doi']
+    if doi in existing_dois:
+        return -1
+    year = record['year']
+    journal = record['journal']
+    title = record['title']
+    abstract = record['abstract']
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    try:
+        # IGNORE if doi is existing, also robust against duplicates from Crossref download
+        cursor.execute("""INSERT OR IGNORE INTO records (doi, year, journal, title, abstract)
+        VALUES ({doi}, {year}, {journal}, {title}, {abstract})""".format(
+            doi='"{}"'.format(escape_str(doi)),
+            year=year if year else "NULL",
+            journal='"{}"'.format(escape_str(journal)) if journal else "NULL",
+            title='"{}"'.format(escape_str(title)) if title else "NULL",
+            abstract='"{}"'.format(escape_str(abstract)) if abstract else "NULL"
+        ))
+    except sqlite3.OperationalError as e:
+        print(e)
+        return 1
+    return 0
+
+
+# This runs for 30 min on SSD
+# ~50k records/s or 20s/batch
+it = (record for batch_file in batch_iter(crossref_batch_files) for record in record_iter(batch_file))
+status = [write_crossref_record(cursor, record, existing_dois=existing_dois) for record in tqdm.tqdm(it, desc='Parsing')]
+
+print("Parsed {} records from Crossref. {} new, {} already existing.".format(len(status), sum([x == 0 for x in status]), sum([x == -1 for x in status])))
+## update 2020/07/25
+# Parsed 86.178.312 records from Crossref. 37.686.840 new, 48.491.472 already existing.
+## update 2021/01/08
+# Parsed 8.822.987 records from Crossref. 2.567.850 new, 6.255.137 already existing.
+
+
+connection.commit()
+
+
+# Rebuild fts5 index
+## This runs for ~20min
+sql_command = """INSERT INTO records_fts5(records_fts5) VALUES('rebuild');"""
+cursor.execute(sql_command)
+connection.commit()
+
+## This runs for ~1h
+sql_command = """INSERT INTO records_abstract_fts5(records_abstract_fts5) VALUES('rebuild');"""
+cursor.execute(sql_command)
+connection.commit()
+
+# CREATE indices
+sql_command = """CREATE INDEX records_year ON records(year, journal);"""
+cursor.execute(sql_command)
+connection.commit()
+
+sql_command = """CREATE INDEX records_journal ON records(journal);"""
+cursor.execute(sql_command)
+connection.commit()
+
+
+
+
+# Total data base size:
+cursor.execute("""SELECT COUNT(*) c FROM records;""")
+cursor.fetchone()
+# 113.709.572
+# 116.275.278
+
+
+cursor.execute("""SELECT COUNT(*) c FROM citations;""")
+cursor.fetchone()
+# 332.997.300
+
+
+
+
+# load COCI citation edges into memory
+# expected:
+# v7:
+# 58.876.621 bibliographic resources;
+# 721.655.392 citation links.
+# v9:
+# 60,778,357 bibliographic resources.
+# 759,516,507 citations;
+
+COCI_file = '../00_data/COCI/6741422.tsv.gz'
+COCI_iter = (line.decode().strip().split('\t') for line in tqdm.tqdm(gzip.open(COCI_file, 'rb'), desc='Parsing',  ncols=150))
+
+# update existing dois
+## pre-loading takes 18G RAM
+cursor.execute("""SELECT rowid, doi FROM records;""")
+doi_map = {doi:rowid for rowid, doi in cursor}
+print("Parsing COCI for {} existing dois.".format(len(doi_map)))
+# Parsing COCI for 113.709.572 existing dois.
+# Parsing COCI for 116.275.278 existing dois.
+
+
+def write_citation(cursor, citing_doi, cited_doi):
+    cited = doi_map.get(cited_doi)
+    citing = doi_map.get(citing_doi)
+    if citing and cited:
+        try:
+            cursor.execute("""INSERT OR IGNORE INTO citations (citing, cited) VALUES ({}, {})""".format(
+                citing, cited
+            ))
+            return 0
+        except sqlite3.OperationalError as e:
+            print(e)
+            return 1
+    else:
+        return 1
+
+# This runs for ~2h on SSD
+# ~100k records/s
+status = [write_citation(cursor, citing, cited) for citing, cited in COCI_iter if citing != cited]
+print("Added/updated {} citation edges, {} failed.".format(len(status), sum(status)))
+# Added/updated 654.784.766 citation edges, 0 failed.
+# Added/updated 759.444.200 citation edges, 75.976.771 failed.
+
+
+connection.commit()
+
+
+cursor.execute("""SELECT COUNT(*) c FROM citations;""")
+cursor.fetchone()
+# 874.094.865
+# 901.631.756
+
+cursor.execute("SELECT COUNT(*) FROM records WHERE title IS NOT NULL;")
+cursor.fetchone()
+# 112.787.497
+# 115.352.463
+
+cursor.execute("SELECT COUNT(*) FROM records WHERE title IS NOT NULL AND abstract IS NOT NULL;")
+cursor.fetchone()
+# 56.080.898
+# 56.866.900
+
+
+
+
+# field of research expansion
+citation_cursor = connection.cursor()
+cursor.execute("SELECT ROWID FROM records;")
+
+def find_field(rowid):
+    # get fields from rowid
+    citation_cursor.execute("SELECT fields FROM records WHERE ROWID = {};".format(rowid))
+    fields = next(citation_cursor)[0]
+    fields = fields.split('|') if fields else []
+    # field is single value
+    if len(fields) == 1:
+        citation_cursor.execute("UPDATE records SET field = '{}' WHERE ROWID = {};".format(fields[0], rowid))
+        return 1
+    # fields is missing or multiple, get peer paper
+    citation_cursor.execute("SELECT citing, cited FROM citations WHERE citing = {} OR cited = {};".format(rowid, rowid))
+    peers = [(citing, cited) for citing, cited in citation_cursor]
+    cited_peers = set([cited for citing, cited in peers if citing == rowid])
+    citing_peers = set([citing for citing, cited in peers if cited == rowid])
+    def get_peer_fields(peers):
+        citation_cursor.execute("SELECT fields FROM records WHERE ROWID IN ({});".format(
+            ','.join([str(x) for x in peers])))
+        return [field for fields in citation_cursor if fields[0] for field in fields[0].split('|')]
+
+    # field is multiple or missing, take majority from cited or citing papers
+    if cited_peers:
+        cited_ovl_fields = get_peer_fields(cited_peers)
+        if fields:
+            cited_ovl_fields = [field for field in cited_ovl_fields if field in fields]
+        fields += cited_ovl_fields
+        field, _ = Counter(fields).most_common(1)[0] if fields else (None, None)
+        if field:
+            citation_cursor.execute("UPDATE records SET field = '{}' WHERE ROWID = {};".format(field, rowid))
+            return 2
+    if citing_peers:
+        citing_ovl_fields = get_peer_fields(citing_peers)
+        if fields:
+            citing_ovl_fields = [field for field in citing_ovl_fields if field in fields]
+        fields += citing_ovl_fields
+        field, _ = Counter(fields).most_common(1)[0] if fields else (None, None)
+        if field:
+            citation_cursor.execute("UPDATE records SET field = '{}' WHERE ROWID = {};".format(field, rowid))
+            return 3
+    return 4
+
+
+# This runs for 10 h on SSD
+# ~2-10k records/s
+status = [find_field(rowid[0]) for rowid in tqdm.tqdm(cursor, desc='Updating')]
+s = np.array(status)
+print("Updated {} records, {} singular, {} from cited, {} from citing. {} remain unset.".format(
+    len(s),
+    np.sum(s == 1),
+    np.sum(s == 2),
+    np.sum(s == 3),
+    np.sum(s == 4)
+    ))
+# Updated 115.058.103 records, 62.361.748 singular, 16.045.566 from cited, 10.861.702 from citing. 25.789.087 remain unset.
+
+
+
+
+# done
+cursor.execute("""VACUUM""")
+connection.close()
+```
+
+
+
+
+
+
+
+
+# BioRxiv
+python3
+```
+import os, sys, glob
+import gzip, re, json
+import sqlite3
+import tqdm
+import numpy as np
+import pandas as pd
+from collections import Counter
+
+
+#db_file = 'BioRxiv.db'
+db_file = '/scratch/local2/giesselm/scholar/bioRxiv.db'
+
+connection = sqlite3.connect(db_file)
+cursor = connection.cursor()
+
+cursor.execute("pragma journal_mode = MEMORY;")
+cursor.execute("pragma synchronous = OFF;")
+cursor.execute("""pragma page_size;""")
+cursor.fetchall()
+cursor.execute("""pragma cache_size = 100000;""")
+cursor.execute("""pragma cache_size;""")
+cursor.fetchall()
+
+# page size is updated by VACUUM
+cursor.execute("""VACUUM""")
+connection.commit()
+
+
+
+
+# CREATE tables
+## main records table
+sql_command = """
+CREATE TABLE records (
+rowid INTEGER PRIMARY KEY,
+doi TEXT NOT NULL,
+year INTEGER,
+month INTEGER,
+day INTEGER,
+journal TEXT,
+title TEXT,
+abstract TEXT,
+field TEXT,
+published TEXT,
+version INTEGER
+);"""
+cursor.execute(sql_command)
+
+# CREATE indices
+sql_command = """CREATE INDEX records_doi ON records(doi);"""
+cursor.execute(sql_command)
+connection.commit()
+
+## CREATE fts5 index
+sql_command = """CREATE VIRTUAL TABLE records_title_fts5 USING fts5(title, content=records, content_rowid=rowid, tokenize='porter ascii');"""
+cursor.execute(sql_command)
+connection.commit()
+
+## CREATE fts5 index
+sql_command = """CREATE VIRTUAL TABLE records_abstract_fts5 USING fts5(abstract, content=records, content_rowid=rowid, tokenize='porter ascii');"""
+cursor.execute(sql_command)
+connection.commit()
+
+
+
+
+# INSERT data
+bioRxiv_file = '../00_data/bioRxiv/bioRxiv.jsonl.gz'
+def record_iter(batch_file):
+    data = gzip.open(batch_file, 'rb').read()
+    return (json.loads(record.group(0).decode()) for record in re.finditer(rb'\{.*?\}(?=(\n))', data))
+
+
+bioRxiv_iter = record_iter(bioRxiv_file)
+
+def write_bioRxiv_record(cursor, record):
+    doi = record['doi']
+    year = record['date'][:4]
+    month = record['date'][5:7]
+    day = record['date'][8:10]
+    title = record['title']
+    abstract = record['abstract']
+    field = record['category'].lower().strip()
+    published = record['published']
+    version = record['version']
+    def escape_str(s):
+        return re.sub(r'"', r'""', s)
+    try:
+        cursor.execute("""INSERT OR REPLACE INTO records (doi, year, month, day, journal, title, abstract, field, published, version)
+        VALUES ({doi}, {year}, {month}, {day}, {journal}, {title}, {abstract}, {field}, {published}, {version})""".format(
+            doi='"{}"'.format(escape_str(doi)),
+            year=year if year else "NULL",
+            month=month if month else "NULL",
+            day=day if day else "NULL",
+            journal='"bioRxiv"',
+            title='"{}"'.format(escape_str(title)) if title else "NULL",
+            abstract='"{}"'.format(escape_str(abstract)) if abstract else "NULL",
+            field='"{}"'.format(field) if field else "NULL",
+            published='"{}"'.format(published) if published != 'NA' else "NULL",
+            version=version
+        ))
+    except sqlite3.OperationalError as e:
+        print(e)
+        return 1
+    return 0
+
+
+status = [write_bioRxiv_record(cursor, record) for record in bioRxiv_iter]
+
+print("Wrote {} records from bioRxiv, {} failed.".format(len(status), sum(status)))
+# Wrote 128783 records from bioRxiv, 0 failed.
+# Wrote 147807 records from bioRxiv, 0 failed.
+
+# remove duplicate doi rows, keep only last version of post
+cursor.execute("DELETE FROM records WHERE rowid NOT IN (SELECT rowid FROM records GROUP BY doi, published HAVING version = max(version));")
+connection.commit()
+
+cursor.execute("SELECT COUNT(*) c FROM records;")
+next(cursor)
+#  93.643
+# 114.727
+cursor.execute("VACUUM")
+connection.commit()
+
+
+# Rebuild fts5 index
+sql_command = """INSERT INTO records_title_fts5(records_title_fts5) VALUES('rebuild');"""
+cursor.execute(sql_command)
+connection.commit()
+
+# Rebuild fts5 index
+sql_command = """INSERT INTO records_abstract_fts5(records_abstract_fts5) VALUES('rebuild');"""
+cursor.execute(sql_command)
+connection.commit()
+
+
+# test
+sql_command = """SELECT * FROM records JOIN records_title_fts5 ON records.rowid = records_title_fts5.rowid WHERE records_title_fts5 MATCH 'Repeat expansion and methylation state analysis with nanopore sequencing';"""
+cursor.execute(sql_command)
+cursor.fetchone()
+
+
+# paper with published doi
+cursor.execute("SELECT COUNT(*) c FROM records WHERE published IS NOT NULL;")
+next(cursor)
+# 40.858
+# 49.250
+
+db_file = '/scratch/local2/giesselm/scholar/scholar.db'
+
+connection2 = sqlite3.connect(db_file)
+cursor2 = connection2.cursor()
+
+cursor.execute("SELECT published FROM records WHERE published IS NOT NULL;")
+matches = [cursor2.execute("""SELECT COUNT(*) c FROM records WHERE doi = '{}' ;""".format(doi[0])).fetchone()[0] for doi in cursor]
+
+len(matches)
+# 49250
+
+sum(matches)
+# 46196
+
+sum(matches) / len(matches)
+0.94
+# HELL YEAH
+
+```
